@@ -1,0 +1,23 @@
+[package]
+name = "protocol"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+futures = "0.3.28"
+tokio-util = { version = "0.7.8", features = ["time"] }
+
+[dependencies.tokio]
+version = "1.29.1"
+features = [
+  "rt",
+  "rt-multi-thread",
+  "io-util",
+  "io-std",
+  "net",
+  "time",
+  "macros",
+  "sync"
+]
