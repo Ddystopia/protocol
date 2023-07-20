@@ -37,7 +37,8 @@ vol. 29, no. 3, pp. 353-363, March 1981, doi: 10.1109/TCOM.1981.1094999. Url:
 
 - d: 4 bits for discriminant
 - p: 11 bits for payload size (valid range [1-1500])
-- s: 32 bits for transfer size in bytes n - 22 bytes for name
+- s: 32 bits for transfer size in bytes
+- n: 22 bytes for name
 (s in little endian)
 
 | 0123456789abcdef | 0123456789abcdef |

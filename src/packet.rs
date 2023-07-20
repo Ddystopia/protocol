@@ -10,6 +10,8 @@ pub struct SeqNum(pub u32);
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum Packet {
+    Syn,
+    SynAck(SeqNum),
     Init {
         payload_size: u16,
         transfer_size: u32,
@@ -24,28 +26,71 @@ pub enum Packet {
     Nak(SeqNum),
     KeepAlive,
     InitOk,
-    KaOk,
+    KeepAliveOk,
 }
 
 const DISCRIMINANT_MASK: u8 = 0xF0;
 
-const INIT: u8 = 0b0000 << 4;
-const DATA: u8 = 0b0001 << 4;
-const KEEP_ALIVE: u8 = 0b0010 << 4;
-const INIT_OK: u8 = 0b0011 << 4;
-const KEEP_ALIVE_OK: u8 = 0b100 << 4;
-const ACK: u8 = 0b0101 << 4;
-const NAK: u8 = 0b0110 << 4;
+#[repr(u8)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+enum PacketType {
+    Syn = 0b0111 << 4,
+    SynAck = 0b1000 << 4,
+    Init = 0b0000 << 4,
+    Data = 0b0001 << 4,
+    Ack = 0b0101 << 4,
+    Nak = 0b0110 << 4,
+    KeepAlive = 0b0010 << 4,
+    InitOk = 0b0011 << 4,
+    KeepAliveOk = 0b100 << 4,
+}
+
+impl TryFrom<u8> for PacketType {
+    type Error = ();
+    fn try_from(value: u8) -> Result<Self, Self::Error> {
+        if value & !DISCRIMINANT_MASK != 0 {
+            return Err(());
+        }
+        let result = match value >> 4 {
+            0b0111 => Ok(Self::Syn),
+            0b1000 => Ok(Self::SynAck),
+            0b0000 => Ok(Self::Init),
+            0b0001 => Ok(Self::Data),
+            0b0101 => Ok(Self::Ack),
+            0b0110 => Ok(Self::Nak),
+            0b0010 => Ok(Self::KeepAlive),
+            0b0011 => Ok(Self::InitOk),
+            0b0100 => Ok(Self::KeepAliveOk),
+            _ => Err(()),
+        };
+        assert!(
+            result.map_or(true, |x| x as u8 == value),
+            "Conversion of Packet type is wrong"
+        );
+        result
+    }
+}
 
 const ASSERT_CONSTANTS: () = assert_constants();
 
 const fn assert_constants() {
-    const DISCRIMINANTS: [u8; 7] = [INIT, DATA, KEEP_ALIVE, INIT_OK, KEEP_ALIVE_OK, ACK, NAK];
+    const DISCRIMINANTS: [PacketType; 9] = [
+        PacketType::Syn,
+        PacketType::SynAck,
+        PacketType::Init,
+        PacketType::Data,
+        PacketType::KeepAlive,
+        PacketType::InitOk,
+        PacketType::KeepAliveOk,
+        PacketType::Ack,
+        PacketType::Nak,
+    ];
+    const LEN: usize = DISCRIMINANTS.len();
     let mut i = 0;
 
-    while i < 7 {
+    while i < LEN {
         assert!(
-            DISCRIMINANTS[i] & !DISCRIMINANT_MASK == 0,
+            DISCRIMINANTS[i] as u8 & !DISCRIMINANT_MASK == 0,
             "Discriminant is wrong"
         );
         i += 1;
@@ -53,7 +98,7 @@ const fn assert_constants() {
 }
 
 fn string_from_null_terminated(buf: &[u8]) -> String {
-    let name_end = buf.iter().take(23).position(|&x| x == 0).unwrap_or(23);
+    let name_end = buf.iter().take(22).position(|&x| x == 0).unwrap_or(23);
     String::from_utf8_lossy(&buf[..name_end]).into_owned()
 }
 
@@ -81,10 +126,10 @@ impl Packet {
     /// # Panics
     /// When discriminant is unknown.  TODO: Change to return an Option
     #[must_use]
-    pub fn deserialize(bytes: &[u8]) -> Self {
+    pub fn deserialize(bytes: &[u8]) -> Option<Self> {
         let discriminant = bytes[0] & DISCRIMINANT_MASK;
-        match discriminant {
-            INIT => {
+        let packet = match PacketType::try_from(discriminant).ok()? {
+            PacketType::Init => {
                 let first = bytes[0] & !DISCRIMINANT_MASK;
                 let payload_size = ((first as u16) << 7) | ((bytes[1] as u16) >> 1);
                 let transfer_size = u32::from_le_bytes([bytes[2], bytes[3], bytes[4], bytes[5]]);
@@ -94,17 +139,19 @@ impl Packet {
                     name: string_from_null_terminated(&bytes[6..28]),
                 }
             }
-            DATA => Self::Data {
+            PacketType::Data => Self::Data {
                 seq_num: Self::decode_sequence(&bytes[0..4]),
                 data: bytes[4..].to_vec(),
             },
-            ACK => Self::Ack(Self::decode_sequence(&bytes[0..4])),
-            NAK => Self::Nak(Self::decode_sequence(&bytes[0..4])),
-            KEEP_ALIVE => Self::KeepAlive,
-            INIT_OK => Self::InitOk,
-            KEEP_ALIVE_OK => Self::KaOk,
-            _ => panic!("Unknown packet discriminant"),
-        }
+            PacketType::Ack => Self::Ack(Self::decode_sequence(&bytes[0..4])),
+            PacketType::Nak => Self::Nak(Self::decode_sequence(&bytes[0..4])),
+            PacketType::KeepAlive => Self::KeepAlive,
+            PacketType::InitOk => Self::InitOk,
+            PacketType::KeepAliveOk => Self::KeepAliveOk,
+            PacketType::Syn => Self::Syn,
+            PacketType::SynAck => Self::SynAck(Self::decode_sequence(&bytes[0..4])),
+        };
+        Some(packet)
     }
 
     pub fn serialize(&self, buf: &mut [u8]) -> usize {
@@ -119,12 +166,15 @@ impl Packet {
                 debug_assert!(ps, "Payload size should have 5 high bits zero");
                 debug_assert!(len, "Name should not be greater then 22 bytes");
             }
-            Self::Data { seq_num, data: _ } | Self::Ack(seq_num) | Self::Nak(seq_num) => {
+            Self::Data { seq_num, data: _ }
+            | Self::Ack(seq_num)
+            | Self::Nak(seq_num)
+            | Self::SynAck(seq_num) => {
                 let seq = seq_num.0 & 0xF0_00_00_00 == 0;
                 debug_assert!(seq, "Seq num should have 4 high bits zero");
             }
 
-            Self::KeepAlive | Self::InitOk | Self::KaOk => {}
+            Self::Syn | Self::KeepAlive | Self::InitOk | Self::KeepAliveOk => {}
         }
 
         let result_len;
@@ -148,25 +198,27 @@ impl Packet {
                 buf[4..][..data.len()].copy_from_slice(data);
                 result_len = 4 + data.len();
             }
-            Self::Ack(seq_num) | Self::Nak(seq_num) => {
+            Self::SynAck(seq_num) | Self::Ack(seq_num) | Self::Nak(seq_num) => {
                 Self::encode_sequence(*seq_num, &mut buf[0..4]);
                 result_len = 4;
             }
-            Self::KeepAlive | Self::InitOk | Self::KaOk => result_len = 1
+            Self::Syn | Self::KeepAlive | Self::InitOk | Self::KeepAliveOk => result_len = 1,
         }
 
         let discriminant = match self {
-            Self::Init { .. } => INIT,
-            Self::Data { .. } => DATA,
-            Self::Ack(..) => ACK,
-            Self::Nak(..) => NAK,
-            Self::KeepAlive => KEEP_ALIVE,
-            Self::InitOk => INIT_OK,
-            Self::KaOk => KEEP_ALIVE_OK,
+            Self::Init { .. } => PacketType::Init,
+            Self::Data { .. } => PacketType::Data,
+            Self::Ack(..) => PacketType::Ack,
+            Self::Nak(..) => PacketType::Nak,
+            Self::KeepAlive => PacketType::KeepAlive,
+            Self::InitOk => PacketType::InitOk,
+            Self::KeepAliveOk => PacketType::KeepAliveOk,
+            Self::Syn => PacketType::Syn,
+            Self::SynAck(..) => PacketType::SynAck,
         };
 
         buf[0] &= !DISCRIMINANT_MASK;
-        buf[0] |= discriminant;
+        buf[0] |= discriminant as u8;
         // maybe `buf[0] ^= discriminant`, but idk how it works
 
         result_len
@@ -205,7 +257,7 @@ mod tests {
             0b0000_0000,
         ]);
         bytes[6..11].copy_from_slice(b"hello");
-        let packet = Packet::deserialize(&bytes);
+        let packet = Packet::deserialize(&bytes).unwrap();
         if let Packet::Init {
             payload_size,
             transfer_size,
@@ -225,7 +277,7 @@ mod tests {
         let mut bytes = [0u8; 9];
         bytes[0..4].copy_from_slice(&[0b0001_0000, 0b0000_0000, 0b1000_0000, 0b1111_1111]);
         bytes[4..9].copy_from_slice(b"data!");
-        let packet = Packet::deserialize(&bytes);
+        let packet = Packet::deserialize(&bytes).unwrap();
         if let Packet::Data {
             seq_num: sequence,
             data,
@@ -248,7 +300,7 @@ mod tests {
 
         let mut buf = vec![0; 28];
         packet.serialize(&mut buf);
-        let received_packet = Packet::deserialize(&buf);
+        let received_packet = Packet::deserialize(&buf).unwrap();
 
         assert_eq!(packet, received_packet);
     }
@@ -258,10 +310,13 @@ mod tests {
         let data = vec![1, 2, 3, 4, 5];
         let mut buf = vec![0; 4 + data.len()];
 
-        let packet = Packet::Data { seq_num: SeqNum(5), data };
+        let packet = Packet::Data {
+            seq_num: SeqNum(5),
+            data,
+        };
 
         packet.serialize(&mut buf);
-        let received_packet = Packet::deserialize(&buf);
+        let received_packet = Packet::deserialize(&buf).unwrap();
 
         assert_eq!(packet, received_packet);
     }
@@ -272,7 +327,7 @@ mod tests {
 
         let mut buf = [0; 4];
         packet.serialize(&mut buf);
-        let received_packet = Packet::deserialize(&buf);
+        let received_packet = Packet::deserialize(&buf).unwrap();
 
         assert_eq!(packet, received_packet);
     }
@@ -283,7 +338,7 @@ mod tests {
 
         let mut buf = [0; 4];
         packet.serialize(&mut buf);
-        let received_packet = Packet::deserialize(&buf);
+        let received_packet = Packet::deserialize(&buf).unwrap();
 
         assert_eq!(packet, received_packet);
     }
@@ -294,7 +349,7 @@ mod tests {
 
         let mut buf = [0; 1];
         packet.serialize(&mut buf);
-        let received_packet = Packet::deserialize(&buf);
+        let received_packet = Packet::deserialize(&buf).unwrap();
 
         assert_eq!(packet, received_packet);
     }
@@ -305,18 +360,18 @@ mod tests {
 
         let mut buf = [0; 1];
         packet.serialize(&mut buf);
-        let received_packet = Packet::deserialize(&buf);
+        let received_packet = Packet::deserialize(&buf).unwrap();
 
         assert_eq!(packet, received_packet);
     }
 
     #[test]
     fn test_ka_ok_packet() {
-        let packet = Packet::KaOk;
+        let packet = Packet::KeepAliveOk;
 
         let mut buf = [0; 1];
         packet.serialize(&mut buf);
-        let received_packet = Packet::deserialize(&buf);
+        let received_packet = Packet::deserialize(&buf).unwrap();
 
         assert_eq!(packet, received_packet);
     }

@@ -1,9 +1,10 @@
+#![allow(dead_code, unused_imports)]
 use std::error::Error;
-use std::io::Write;
 use std::sync::Arc;
-use tokio::io::{stdin, AsyncBufReadExt, BufReader};
+use std::time::Duration;
 use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
+use tokio::time;
 
 use protocol::packet::Packet;
 
@@ -12,38 +13,9 @@ const B_PORT: &str = "127.0.0.1:4000";
 
 const MTU: usize = 1500;
 
-fn usage1() {
-    let this = "127.0.0.1:3000";
-    let other = "127.0.0.1:4000";
-
-    let server = Server::bind(this);
-    let connection = server.connect(other);
-
-    {
-        let (sender, receiver) = connection.split(); // mut borrow of connection
-
-        // send and recv are taking `&mut self`
-
-        let sending_result = sender.send(Message::File(file)).await;
-        let message = receiver.recv().await;
-    }
-
-    {
-        let (sender, receiver) = connection.split();
-    // ...
-    }
-}
-
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn Error>> {
+async fn start(machine: &str) -> Result<(), Box<dyn Error>> {
     let (tx, mut rx) = mpsc::channel(100);
 
-    print!("Enter Mathine A or B: ");
-    std::io::stdout().flush().unwrap();
-
-    let mut machine = String::new();
-    let mut reader = BufReader::new(stdin());
-    reader.read_line(&mut machine).await?;
     let (this, other) = match machine.trim() {
         "A" => (A_PORT, B_PORT),
         "B" => (B_PORT, A_PORT),
@@ -88,3 +60,19 @@ async fn main() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn Error>> {
+    let delay_for_active = tokio::time::sleep(Duration::from_millis(100));
+
+    let hs1 = tokio::spawn(async move {
+        delay_for_active.await;
+        start("A").await.ok()
+    });
+
+    let hs2 = tokio::spawn(async move { start("B").await.ok() });
+
+    let (r1, r2) = tokio::join!(hs1, hs2);
+    r1.unwrap().unwrap();
+    r2.unwrap().unwrap();
+    Ok(())
+}
