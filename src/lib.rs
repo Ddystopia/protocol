@@ -1,10 +1,10 @@
 #![allow(clippy::missing_errors_doc)]
 
 mod event_loop;
-pub mod handshake;
-pub mod packet;
+mod handshake;
+mod packet;
 
-use std::{io, sync::Arc};
+use std::{io, sync::Arc, time::Duration};
 
 use handshake::Handshake;
 use tokio::{
@@ -18,10 +18,19 @@ use tokio::{
 
 pub(crate) const MTU: usize = 1500;
 
+pub(crate) const TIMEOUT: Duration = Duration::from_millis(100);
+
 #[derive(Debug)]
-pub enum Message {
-    TextMessage,
-    File,
+enum MessageKind {
+    Text,
+    File(String),
+}
+
+#[derive(Debug)]
+pub struct Message {
+    kind: MessageKind,
+    payload: Vec<u8>,
+    payload_size: u16,
 }
 
 pub struct Server {

@@ -1,11 +1,12 @@
+use std::io;
 use std::io::ErrorKind;
 use std::net::SocketAddr;
-use std::{io, time::Duration};
 
 use tokio::net::{ToSocketAddrs, UdpSocket};
 use tokio::time::{self, Instant};
 
 use crate::packet::Packet;
+use crate::TIMEOUT;
 use crate::{packet::SeqNum, MTU};
 
 mod private {
@@ -15,8 +16,6 @@ mod private {
 
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct Handshake(private::PrivateZst);
-
-const TIMEOUT: Duration = Duration::from_millis(100);
 
 #[inline]
 pub(crate) async fn handshake_active(
@@ -135,8 +134,8 @@ enum StatePassive {
 }
 
 #[derive(Debug)]
-enum PassiveSignal {
-    Packet(Packet, SocketAddr),
+enum PassiveSignal<'a> {
+    Packet(Packet<'a>, SocketAddr),
     Error(std::io::Error),
     Timeout,
 }
@@ -208,6 +207,8 @@ async fn handshake_passive_sm(socket: &UdpSocket) -> io::Result<Handshake> {
 
 #[cfg(test)]
 mod test {
+    use std::time::Duration;
+
     use super::*;
     use tokio::net::UdpSocket;
 
@@ -249,4 +250,3 @@ mod test {
         r2.unwrap().unwrap();
     }
 }
-

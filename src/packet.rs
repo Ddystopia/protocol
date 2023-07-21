@@ -1,4 +1,6 @@
 #![allow(dead_code)]
+
+use std::ops::AddAssign;
 const MTU: usize = 1500;
 
 fn main() {
@@ -8,19 +10,24 @@ fn main() {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct SeqNum(pub u32);
 
+impl AddAssign for SeqNum {
+    fn add_assign(&mut self, rhs: Self) {
+        self.0 = self.0.wrapping_add(rhs.0);
+    }
+}
+
 #[derive(Debug, PartialEq, Eq)]
-pub enum Packet {
+pub enum Packet<'a> {
     Syn,
     SynAck(SeqNum),
     Init {
-        payload_size: u16,
-        transfer_size: u32,
-        name: String,
+        payload: u16,
+        transfer: u32,
+        name: &'a str,
     },
     Data {
         seq_num: SeqNum,
-        //  TODO: Cow (for sender borrow for receiver own)
-        data: Vec<u8>,
+        data: &'a [u8],
     },
     Ack(SeqNum),
     Nak(SeqNum),
@@ -97,12 +104,12 @@ const fn assert_constants() {
     }
 }
 
-fn string_from_null_terminated(buf: &[u8]) -> String {
+fn string_from_null_terminated(buf: &[u8]) -> Option<&str> {
     let name_end = buf.iter().take(22).position(|&x| x == 0).unwrap_or(23);
-    String::from_utf8_lossy(&buf[..name_end]).into_owned()
+    std::str::from_utf8(&buf[..name_end]).ok()
 }
 
-impl Packet {
+impl<'a> Packet<'a> {
     /// Parses 28 bytes u32 like that
     ///
     /// |0123456789abcdef|
@@ -123,10 +130,8 @@ impl Packet {
         buf.copy_from_slice(&sequence.0.to_be_bytes());
     }
 
-    /// # Panics
-    /// When discriminant is unknown.  TODO: Change to return an Option
     #[must_use]
-    pub fn deserialize(bytes: &[u8]) -> Option<Self> {
+    pub fn deserialize(bytes: &'a [u8]) -> Option<Self> {
         let discriminant = bytes[0] & DISCRIMINANT_MASK;
         let packet = match PacketType::try_from(discriminant).ok()? {
             PacketType::Init => {
@@ -134,14 +139,14 @@ impl Packet {
                 let payload_size = ((first as u16) << 7) | ((bytes[1] as u16) >> 1);
                 let transfer_size = u32::from_le_bytes([bytes[2], bytes[3], bytes[4], bytes[5]]);
                 Self::Init {
-                    payload_size,
-                    transfer_size,
-                    name: string_from_null_terminated(&bytes[6..28]),
+                    payload: payload_size,
+                    transfer: transfer_size,
+                    name: string_from_null_terminated(&bytes[6..28])?,
                 }
             }
             PacketType::Data => Self::Data {
                 seq_num: Self::decode_sequence(&bytes[0..4]),
-                data: bytes[4..].to_vec(),
+                data: &bytes[4..],
             },
             PacketType::Ack => Self::Ack(Self::decode_sequence(&bytes[0..4])),
             PacketType::Nak => Self::Nak(Self::decode_sequence(&bytes[0..4])),
@@ -157,8 +162,8 @@ impl Packet {
     pub fn serialize(&self, buf: &mut [u8]) -> usize {
         match self {
             Self::Init {
-                payload_size,
-                transfer_size: _,
+                payload: payload_size,
+                transfer: _,
                 name,
             } => {
                 let ps = payload_size & 0b1111_1000_0000_0000 == 0;
@@ -179,13 +184,13 @@ impl Packet {
 
         let result_len;
 
-        match self {
+        match *self {
             Self::Init {
-                payload_size,
-                transfer_size,
+                payload: payload_size,
+                transfer: transfer_size,
                 name,
             } => {
-                let payload_size = *payload_size;
+                let payload_size = payload_size;
                 buf[0] = (payload_size >> 7) as u8;
                 buf[1] = ((payload_size as u8) & 0b0111_1111) << 1;
                 buf[2..6].copy_from_slice(&transfer_size.to_le_bytes());
@@ -194,12 +199,12 @@ impl Packet {
                 result_len = 28;
             }
             Self::Data { seq_num, data } => {
-                Self::encode_sequence(*seq_num, &mut buf[0..4]);
+                Self::encode_sequence(seq_num, &mut buf[0..4]);
                 buf[4..][..data.len()].copy_from_slice(data);
                 result_len = 4 + data.len();
             }
             Self::SynAck(seq_num) | Self::Ack(seq_num) | Self::Nak(seq_num) => {
-                Self::encode_sequence(*seq_num, &mut buf[0..4]);
+                Self::encode_sequence(seq_num, &mut buf[0..4]);
                 result_len = 4;
             }
             Self::Syn | Self::KeepAlive | Self::InitOk | Self::KeepAliveOk => result_len = 1,
@@ -259,8 +264,8 @@ mod tests {
         bytes[6..11].copy_from_slice(b"hello");
         let packet = Packet::deserialize(&bytes).unwrap();
         if let Packet::Init {
-            payload_size,
-            transfer_size,
+            payload: payload_size,
+            transfer: transfer_size,
             name,
         } = packet
         {
@@ -293,9 +298,9 @@ mod tests {
     #[test]
     fn test_init_packet() {
         let packet = Packet::Init {
-            payload_size: 512,
-            transfer_size: 10000,
-            name: String::from("testfile"),
+            payload: 512,
+            transfer: 10000,
+            name: "testfile",
         };
 
         let mut buf = vec![0; 28];
@@ -312,7 +317,7 @@ mod tests {
 
         let packet = Packet::Data {
             seq_num: SeqNum(5),
-            data,
+            data: &data,
         };
 
         packet.serialize(&mut buf);
