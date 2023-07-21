@@ -50,6 +50,8 @@ pub struct Receiver<'a>(&'a mut mpsc::Receiver<Message>);
 //  TODO: Replace mpsc with channel of capacity 1 that not dies as oneshot
 //        Maybe write my own, "Atomics and Locks" is a great book
 //        `AtomicPtr`?
+//  ^^^^^ I think it is not worth it, that channel still has capacity 1
+//        And does not grow.
 pub struct Sender<'a> {
     sender: &'a mut mpsc::Sender<Message>,
     signal: &'a Notify,
@@ -116,7 +118,27 @@ impl Receiver<'_> {
     }
 }
 
+impl Message {
+    #[must_use]
+    pub fn file(payload: Vec<u8>, payload_size: u16, filename: String) -> Self {
+        Self {
+            kind: MessageKind::File(filename),
+            payload,
+            payload_size,
+        }
+    }
+    #[must_use]
+    pub fn text(payload: Vec<u8>, payload_size: u16) -> Self {
+        Self {
+            kind: MessageKind::Text,
+            payload,
+            payload_size,
+        }
+    }
+}
+
 impl Connection {
+    #[must_use]
     pub fn split(&mut self) -> (Sender, Receiver) {
         let sender = &mut self.api_sender_tx;
         let signal = &self.api_sender_notify_rx;
