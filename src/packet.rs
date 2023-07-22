@@ -1,11 +1,7 @@
 #![allow(dead_code)]
 
-use std::ops::AddAssign;
+use std::{ops::AddAssign, str::Utf8Error};
 const MTU: usize = 1500;
-
-fn main() {
-    println!("Hello, World!");
-}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct SeqNum(pub u32);
@@ -23,7 +19,7 @@ pub enum Packet<'a> {
     Init {
         payload: u16,
         transfer: u32,
-        name: &'a str,
+        name: Option<&'a str>,
     },
     Data {
         seq_num: SeqNum,
@@ -34,6 +30,8 @@ pub enum Packet<'a> {
     KeepAlive,
     InitOk,
     KeepAliveOk,
+    Fin,
+    FinOk,
 }
 
 const DISCRIMINANT_MASK: u8 = 0xF0;
@@ -50,6 +48,8 @@ enum PacketType {
     KeepAlive = 0b0010 << 4,
     InitOk = 0b0011 << 4,
     KeepAliveOk = 0b100 << 4,
+    Fin = 0b1001 << 4,
+    FinOk = 0b1010 << 4,
 }
 
 impl TryFrom<u8> for PacketType {
@@ -68,6 +68,8 @@ impl TryFrom<u8> for PacketType {
             0b0010 => Ok(Self::KeepAlive),
             0b0011 => Ok(Self::InitOk),
             0b0100 => Ok(Self::KeepAliveOk),
+            0b1001 => Ok(Self::Fin),
+            0b1010 => Ok(Self::FinOk),
             _ => Err(()),
         };
         assert!(
@@ -81,7 +83,7 @@ impl TryFrom<u8> for PacketType {
 const ASSERT_CONSTANTS: () = assert_constants();
 
 const fn assert_constants() {
-    const DISCRIMINANTS: [PacketType; 9] = [
+    const DISCRIMINANTS: [PacketType; 11] = [
         PacketType::Syn,
         PacketType::SynAck,
         PacketType::Init,
@@ -91,6 +93,8 @@ const fn assert_constants() {
         PacketType::KeepAliveOk,
         PacketType::Ack,
         PacketType::Nak,
+        PacketType::Fin,
+        PacketType::FinOk,
     ];
     const LEN: usize = DISCRIMINANTS.len();
     let mut i = 0;
@@ -104,9 +108,12 @@ const fn assert_constants() {
     }
 }
 
-fn string_from_null_terminated(buf: &[u8]) -> Option<&str> {
+fn string_from_null_terminated(buf: &[u8]) -> Result<Option<&str>, Utf8Error> {
     let name_end = buf.iter().take(22).position(|&x| x == 0).unwrap_or(23);
-    std::str::from_utf8(&buf[..name_end]).ok()
+    if name_end == 0 {
+        return Ok(None);
+    }
+    std::str::from_utf8(&buf[..name_end]).map(Some)
 }
 
 impl<'a> Packet<'a> {
@@ -141,7 +148,7 @@ impl<'a> Packet<'a> {
                 Self::Init {
                     payload: payload_size,
                     transfer: transfer_size,
-                    name: string_from_null_terminated(&bytes[6..28])?,
+                    name: string_from_null_terminated(&bytes[6..28]).ok()?,
                 }
             }
             PacketType::Data => Self::Data {
@@ -155,6 +162,8 @@ impl<'a> Packet<'a> {
             PacketType::KeepAliveOk => Self::KeepAliveOk,
             PacketType::Syn => Self::Syn,
             PacketType::SynAck => Self::SynAck(Self::decode_sequence(&bytes[0..4])),
+            PacketType::Fin => Self::Fin,
+            PacketType::FinOk => Self::FinOk,
         };
         Some(packet)
     }
@@ -167,7 +176,7 @@ impl<'a> Packet<'a> {
                 name,
             } => {
                 let ps = payload_size & 0b1111_1000_0000_0000 == 0;
-                let len = name.bytes().len() <= 22;
+                let len = name.map(|n| n.bytes().len()).unwrap_or(0) <= 22;
                 debug_assert!(ps, "Payload size should have 5 high bits zero");
                 debug_assert!(len, "Name should not be greater then 22 bytes");
             }
@@ -179,7 +188,12 @@ impl<'a> Packet<'a> {
                 debug_assert!(seq, "Seq num should have 4 high bits zero");
             }
 
-            Self::Syn | Self::KeepAlive | Self::InitOk | Self::KeepAliveOk => {}
+            Self::Fin
+            | Self::FinOk
+            | Self::Syn
+            | Self::KeepAlive
+            | Self::InitOk
+            | Self::KeepAliveOk => {}
         }
 
         let result_len;
@@ -194,7 +208,9 @@ impl<'a> Packet<'a> {
                 buf[0] = (payload_size >> 7) as u8;
                 buf[1] = ((payload_size as u8) & 0b0111_1111) << 1;
                 buf[2..6].copy_from_slice(&transfer_size.to_le_bytes());
-                buf[6..][..name.len()].copy_from_slice(name.as_bytes());
+                if let Some(name) = name {
+                    buf[6..][..name.len()].copy_from_slice(name.as_bytes());
+                }
 
                 result_len = 28;
             }
@@ -207,7 +223,12 @@ impl<'a> Packet<'a> {
                 Self::encode_sequence(seq_num, &mut buf[0..4]);
                 result_len = 4;
             }
-            Self::Syn | Self::KeepAlive | Self::InitOk | Self::KeepAliveOk => result_len = 1,
+            Self::Fin
+            | Self::FinOk
+            | Self::Syn
+            | Self::KeepAlive
+            | Self::InitOk
+            | Self::KeepAliveOk => result_len = 1,
         }
 
         let discriminant = match self {
@@ -220,6 +241,8 @@ impl<'a> Packet<'a> {
             Self::KeepAliveOk => PacketType::KeepAliveOk,
             Self::Syn => PacketType::Syn,
             Self::SynAck(..) => PacketType::SynAck,
+            Self::Fin => PacketType::Fin,
+            Self::FinOk => PacketType::FinOk,
         };
 
         buf[0] &= !DISCRIMINANT_MASK;
@@ -270,7 +293,7 @@ mod tests {
         } = packet
         {
             assert_eq!(payload_size, 0b100_0100_0000);
-            assert_eq!(name, "hello");
+            assert_eq!(name.unwrap(), "hello");
             assert_eq!(transfer_size, 0b0000_0000_0000_0101_0110_0011_1000_1111);
         } else {
             panic!("Unexpected packet type");
@@ -300,7 +323,7 @@ mod tests {
         let packet = Packet::Init {
             payload: 512,
             transfer: 10000,
-            name: "testfile",
+            name: Some("testfile"),
         };
 
         let mut buf = vec![0; 28];

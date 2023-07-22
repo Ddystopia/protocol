@@ -1,5 +1,7 @@
 #![allow(clippy::missing_errors_doc)]
 
+// TODO: PGO
+
 mod event_loop;
 mod handshake;
 mod packet;
