@@ -26,13 +26,18 @@ enum Sig<'a> {
     Timeout(DelayEvent),
     SocketError(std::io::Error),
     StartSendingFile(Message),
+    StopSendignFile,
+    KeepAlive,
 }
 
 #[derive(Debug)]
 enum DelayEvent {
-    AckTimeout(SeqNum),
+    Ack(SeqNum),
+    Fin,
+    KeepAliveExpired,
 }
 
+// TODO: Remove this
 #[derive(Debug, PartialEq, Eq, Hash)]
 enum SenderTimeoutKeys {
     SeqNum(SeqNum),
@@ -68,11 +73,13 @@ pub(crate) async fn event_loop(
     mut api_sender_rx: mpsc::Receiver<Message>,
     api_received_messages_tx: mpsc::Sender<Message>,
 ) -> std::io::Result<UdpSocket> {
-    // Invariant: key should be stored somewhere, but only if it is valid
+    // Invariant for `timers`: key should be stored somewhere, but only if it is valid
     let mut timers = DelayQueue::new();
     let mut buf = [0; MTU];
     let mut reader: Option<ReceiveState> = None;
     let mut sender: Option<SendState> = None;
+    let mut keep_alive_key = None;
+    let stop_send = Notify::new();
 
     'event_loop: loop {
         println!("Event loop tick");
@@ -87,6 +94,9 @@ pub(crate) async fn event_loop(
                 msg = api_sender_rx.recv() => {
                     Some(Sig::StartSendingFile(msg.expect("API sender channel closed")))
                 }
+                _ = stop_send.notified() => Some(Sig::StopSendignFile),
+                _ = tokio::time::sleep(TIMEOUT) => Some(Sig::KeepAlive)
+
             }
         };
 
@@ -112,9 +122,27 @@ pub(crate) async fn event_loop(
                 socket.send(&buf[..len]).await?;
                 (r, s)
             }
-            (Sig::Packet(KeepAliveOk), _r, _s) => todo!("When send of keepalive implemented"),
-            (Sig::Packet(Fin | FinOk | Ack(_) | Nak(_)), r, None) => (r, None),
+            (Sig::StopSendignFile | Sig::Packet(Fin | FinOk | Ack(_) | Nak(_)), r, None) => {
+                (r, None)
+            }
             (Sig::Packet(Data { .. } | Fin), None, s) => (None, s),
+            (Sig::Timeout(DelayEvent::KeepAliveExpired), _r, _s) => {
+                return Ok(socket);
+            }
+
+            (Sig::KeepAlive, r, s) => {
+                let len = Packet::KeepAlive.serialize(&mut buf);
+                socket.send(&buf[..len]).await?;
+                let key = timers.insert(DelayEvent::KeepAliveExpired, TIMEOUT);
+                keep_alive_key = Some(key);
+                (r, s)
+            }
+            (Sig::Packet(KeepAliveOk), r, s) => {
+                if let Some(key) = keep_alive_key {
+                    timers.remove(&key);
+                }
+                (r, s)
+            }
 
             // Receiver
             (Sig::Packet(Fin), Some(re), s) => {
@@ -172,6 +200,13 @@ pub(crate) async fn event_loop(
             }
 
             // Sender
+            (Sig::StopSendignFile | Sig::Timeout(DelayEvent::Fin), r, Some(mut se)) => {
+                let len = Packet::Fin.serialize(&mut buf);
+                socket.send(&buf[..len]).await?;
+                let key = timers.insert_at(DelayEvent::Fin, Instant::now() + TIMEOUT);
+                se.timeout_keys.insert(SenderTimeoutKeys::Fin, key);
+                (r, Some(se))
+            }
             (Sig::Packet(FinOk), r, Some(mut se)) => {
                 if se.timeout_keys.remove(&SenderTimeoutKeys::Fin).is_some() {
                     api_sender_notify_tx.notify_waiters();
@@ -222,13 +257,11 @@ pub(crate) async fn event_loop(
 
                 if seq_num == SeqNum(se.seq_num_count() as u32) {
                     // What if NAK ?
-                    // Maybe introduce FIN packet?
                     // Is race possible?
-                    break 'block if se.timeout_keys.is_empty() {
-                        (r, None)
-                    } else {
-                        (r, Some(se))
-                    };
+                    if se.timeout_keys.is_empty() {
+                        stop_send.notify_waiters();
+                    }
+                    break 'block (r, Some(se));
                 }
 
                 se.next_to_send += SeqNum(1);
@@ -239,7 +272,7 @@ pub(crate) async fn event_loop(
             }
 
             (
-                Sig::Packet(Nak(seq_num)) | Sig::Timeout(DelayEvent::AckTimeout(seq_num)),
+                Sig::Packet(Nak(seq_num)) | Sig::Timeout(DelayEvent::Ack(seq_num)),
                 r,
                 Some(mut se),
             ) => {
@@ -272,7 +305,7 @@ async fn send_data_packet(
     .serialize(buf);
     socket.send(&buf[..len]).await?;
 
-    let delay = DelayEvent::AckTimeout(seq_num);
+    let delay = DelayEvent::Ack(seq_num);
     let key = timers.insert_at(delay, Instant::now() + TIMEOUT);
 
     let seq = SenderTimeoutKeys::SeqNum(seq_num);
