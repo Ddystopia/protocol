@@ -6,7 +6,8 @@ mod event_loop;
 mod handshake;
 mod packet;
 
-use std::{io, sync::Arc, time::Duration};
+use std::{io, sync::{Arc, atomic::AtomicBool}, time::Duration};
+use std::sync::atomic::Ordering::Relaxed;
 
 use handshake::Handshake;
 use tokio::{
@@ -44,7 +45,7 @@ pub struct Connection {
     api_received_messages_rx: mpsc::Receiver<Message>,
     api_sender_tx: mpsc::Sender<Message>,
     api_sender_notify_rx: Arc<Notify>,
-    shutdown_tx: Arc<Notify>,
+    shutdown_tx: Arc<AtomicBool>,
 }
 
 pub struct Receiver<'a>(&'a mut mpsc::Receiver<Message>);
@@ -84,8 +85,8 @@ impl Server {
     fn create_connection(self, handshake: Handshake) -> Connection {
         let (api_received_messages_tx, api_received_messages_rx) = mpsc::channel(3);
         let (api_sender_tx, api_sender_rx) = mpsc::channel(1);
+        let shutdown_tx = Arc::new(AtomicBool::new(false));
         let api_sender_notify_rx = Arc::new(Notify::new());
-        let shutdown_tx = Arc::new(Notify::new());
 
         let event_loop = Some(tokio::spawn(event_loop::event_loop(
             self.socket,
@@ -154,7 +155,7 @@ impl Connection {
 
     #[allow(clippy::missing_panics_doc)]
     pub async fn disconnect(mut self) -> Result<Server, ()> {
-        self.shutdown_tx.notify_waiters();
+        self.shutdown_tx.store(true, Relaxed);
         let socket = tokio::join!(self.event_loop.take().unwrap())
             .0
             .map_err(|_| ())?
@@ -166,7 +167,7 @@ impl Connection {
 impl Drop for Connection {
     fn drop(&mut self) {
         if let Some(event_loop) = self.event_loop.take() {
-            self.shutdown_tx.notify_waiters();
+            self.shutdown_tx.store(true, Relaxed);
             event_loop.abort();
         }
     }
@@ -174,6 +175,8 @@ impl Drop for Connection {
 
 #[cfg(test)]
 mod test {
+    use tokio::time::Instant;
+
     use super::*;
 
     #[tokio::test]
@@ -183,31 +186,33 @@ mod test {
         const ADDR1: &str = "127.0.0.1:10201";
         const ADDR2: &str = "127.0.0.1:10202";
 
-        let msg = Message::file(vec![5; 90], 20, "Ivakura.txt".to_string());
+        let size = 400 * 2usize.pow(20);
+        let msg = Message::file(vec![5u8; size], 1496, "Ivakura.txt".to_string());
         let msg_clone = msg.clone();
         dbg!("Here");
+        let start = Instant::now();
 
         let h1 = tokio::spawn(async move {
             let server = Server::bind(ADDR1).await.unwrap();
             let mut connection = server.connect(ADDR2).await.unwrap();
             let (mut tx, _) = connection.split();
-            tx.send(msg_clone)
-                .await
-            // panic!("Sendig done!");
-            // Result::<(), SendError<Message>>::Ok(())
+            tx.send(msg_clone).await
         });
         let h2 = tokio::spawn(async move {
             let server = Server::bind(ADDR2).await.unwrap();
             let mut connection = server.listen().await.unwrap();
             let (_, mut rx) = connection.split();
             rx.recv().await
-            // panic!("Got!");
-            // Result::<Message, SendError<Message>>::Ok(todo!())
         });
 
         let (r1, r2) = tokio::join!(h1, h2);
+        let end = Instant::now();
         r1.unwrap().unwrap();
         let transfered_message = r2.unwrap().unwrap();
         assert_eq!(transfered_message, msg);
+        println!(
+            "Speed: {}Mib/sec",
+            (size / 1000 * 8) / (end - start).as_millis() as usize
+        );
     }
 }

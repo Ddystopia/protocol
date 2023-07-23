@@ -104,14 +104,14 @@ impl<'a> Packet<'a> {
     /// |ssssssssssssssss|
     ///
     //  TODO: Maybe little endian is better
-    #[inline] //  TODO: try #[inline(always)]
+    #[inline]
     fn decode_sequence(bytes: &[u8]) -> SeqNum {
         let bytes = [bytes[0], bytes[1], bytes[2], bytes[3]];
         let mask = (DISCRIMINANT_MASK as u32) << 24;
         SeqNum(u32::from_be_bytes(bytes) & !mask)
     }
 
-    #[inline] //  TODO: try #[inline(always)]
+    #[inline]
     fn encode_sequence(sequence: SeqNum, buf: &mut [u8]) {
         buf.copy_from_slice(&sequence.0.to_be_bytes());
     }
