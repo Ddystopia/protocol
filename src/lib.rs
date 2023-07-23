@@ -22,13 +22,13 @@ pub(crate) const MTU: usize = 1500;
 
 pub(crate) const TIMEOUT: Duration = Duration::from_millis(100);
 
-#[derive(Debug)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 enum MessageKind {
     Text,
     File(String),
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Message {
     kind: MessageKind,
     payload: Vec<u8>,
@@ -71,7 +71,7 @@ impl Server {
         Ok(Self { socket })
     }
 
-    pub async fn connect(self, addr: impl ToSocketAddrs + Clone) -> io::Result<Connection> {
+    pub async fn connect(self, addr: impl ToSocketAddrs) -> io::Result<Connection> {
         let handshake = handshake::handshake_active(&self.socket, addr).await?;
         Ok(self.create_connection(handshake))
     }
@@ -107,6 +107,7 @@ impl Server {
 }
 
 impl Sender<'_> {
+    // TODO: Custom error type, that one leaks internal representation
     pub async fn send(&mut self, message: Message) -> Result<(), SendError<Message>> {
         self.sender.send(message).await?;
         self.signal.notified().await;
@@ -168,5 +169,45 @@ impl Drop for Connection {
             self.shutdown_tx.notify_waiters();
             event_loop.abort();
         }
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+
+    #[tokio::test]
+    #[allow(clippy::diverging_sub_expression)]
+    #[allow(unreachable_code)]
+    async fn hello_world() {
+        const ADDR1: &str = "127.0.0.1:10201";
+        const ADDR2: &str = "127.0.0.1:10202";
+
+        let msg = Message::file(vec![5; 90], 20, "Ivakura.txt".to_string());
+        let msg_clone = msg.clone();
+        dbg!("Here");
+
+        let h1 = tokio::spawn(async move {
+            let server = Server::bind(ADDR1).await.unwrap();
+            let mut connection = server.connect(ADDR2).await.unwrap();
+            let (mut tx, _) = connection.split();
+            tx.send(msg_clone)
+                .await
+            // panic!("Sendig done!");
+            // Result::<(), SendError<Message>>::Ok(())
+        });
+        let h2 = tokio::spawn(async move {
+            let server = Server::bind(ADDR2).await.unwrap();
+            let mut connection = server.listen().await.unwrap();
+            let (_, mut rx) = connection.split();
+            rx.recv().await
+            // panic!("Got!");
+            // Result::<Message, SendError<Message>>::Ok(todo!())
+        });
+
+        let (r1, r2) = tokio::join!(h1, h2);
+        r1.unwrap().unwrap();
+        let transfered_message = r2.unwrap().unwrap();
+        assert_eq!(transfered_message, msg);
     }
 }

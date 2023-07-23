@@ -20,7 +20,7 @@ pub(crate) struct Handshake(private::PrivateZst);
 #[inline]
 pub(crate) async fn handshake_active(
     socket: &UdpSocket,
-    addr: impl ToSocketAddrs + Clone,
+    addr: impl ToSocketAddrs,
 ) -> io::Result<Handshake> {
     socket.connect(addr).await?;
     let mut buf = [0; MTU];
@@ -207,9 +207,9 @@ async fn handshake_passive_sm(socket: &UdpSocket) -> io::Result<Handshake> {
 
 #[cfg(test)]
 mod test {
-    use std::time::Duration;
-
     use super::*;
+
+    use std::time::Duration;
     use tokio::net::UdpSocket;
 
     #[tokio::test]

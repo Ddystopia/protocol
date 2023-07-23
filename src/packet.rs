@@ -55,57 +55,36 @@ enum PacketType {
 impl TryFrom<u8> for PacketType {
     type Error = ();
     fn try_from(value: u8) -> Result<Self, Self::Error> {
-        if value & !DISCRIMINANT_MASK != 0 {
-            return Err(());
-        }
-        let result = match value >> 4 {
-            0b0111 => Ok(Self::Syn),
-            0b1000 => Ok(Self::SynAck),
-            0b0000 => Ok(Self::Init),
-            0b0001 => Ok(Self::Data),
-            0b0101 => Ok(Self::Ack),
-            0b0110 => Ok(Self::Nak),
-            0b0010 => Ok(Self::KeepAlive),
-            0b0011 => Ok(Self::InitOk),
-            0b0100 => Ok(Self::KeepAliveOk),
-            0b1001 => Ok(Self::Fin),
-            0b1010 => Ok(Self::FinOk),
-            _ => Err(()),
-        };
-        assert!(
-            result.map_or(true, |x| x as u8 == value),
-            "Conversion of Packet type is wrong"
-        );
-        result
+        try_from(value)
     }
 }
 
-const ASSERT_CONSTANTS: () = assert_constants();
-
-const fn assert_constants() {
-    const DISCRIMINANTS: [PacketType; 11] = [
-        PacketType::Syn,
-        PacketType::SynAck,
-        PacketType::Init,
-        PacketType::Data,
-        PacketType::KeepAlive,
-        PacketType::InitOk,
-        PacketType::KeepAliveOk,
-        PacketType::Ack,
-        PacketType::Nak,
-        PacketType::Fin,
-        PacketType::FinOk,
-    ];
-    const LEN: usize = DISCRIMINANTS.len();
-    let mut i = 0;
-
-    while i < LEN {
-        assert!(
-            DISCRIMINANTS[i] as u8 & !DISCRIMINANT_MASK == 0,
-            "Discriminant is wrong"
-        );
-        i += 1;
+const fn try_from(value: u8) -> Result<PacketType, ()> {
+    if value & !DISCRIMINANT_MASK != 0 {
+        return Err(());
     }
+    let result = match value >> 4 {
+        0b0111 => Ok(PacketType::Syn),
+        0b1000 => Ok(PacketType::SynAck),
+        0b0000 => Ok(PacketType::Init),
+        0b0001 => Ok(PacketType::Data),
+        0b0101 => Ok(PacketType::Ack),
+        0b0110 => Ok(PacketType::Nak),
+        0b0010 => Ok(PacketType::KeepAlive),
+        0b0011 => Ok(PacketType::InitOk),
+        0b0100 => Ok(PacketType::KeepAliveOk),
+        0b1001 => Ok(PacketType::Fin),
+        0b1010 => Ok(PacketType::FinOk),
+        _ => Err(()),
+    };
+    assert!(
+        match result {
+            Ok(x) => x as u8 == value,
+            Err(_) => true,
+        },
+        "Conversion of Packet type is wrong"
+    );
+    result
 }
 
 fn string_from_null_terminated(buf: &[u8]) -> Result<Option<&str>, Utf8Error> {
@@ -250,6 +229,41 @@ impl<'a> Packet<'a> {
         // maybe `buf[0] ^= discriminant`, but idk how it works
 
         result_len
+    }
+}
+
+const ASSERT_CONSTANTS: () = assert_constants();
+
+const fn assert_constants() {
+    const DISCRIMINANTS: [PacketType; 11] = [
+        PacketType::Syn,
+        PacketType::SynAck,
+        PacketType::Init,
+        PacketType::Data,
+        PacketType::KeepAlive,
+        PacketType::InitOk,
+        PacketType::KeepAliveOk,
+        PacketType::Ack,
+        PacketType::Nak,
+        PacketType::Fin,
+        PacketType::FinOk,
+    ];
+    const LEN: usize = DISCRIMINANTS.len();
+    let mut i = 0;
+
+    while i < LEN {
+        assert!(
+            match try_from(DISCRIMINANTS[i] as u8) {
+                Ok(d) => d as u8 == DISCRIMINANTS[i] as u8,
+                Err(_) => false,
+            },
+            "Try from should work fine."
+        );
+        assert!(
+            DISCRIMINANTS[i] as u8 & !DISCRIMINANT_MASK == 0,
+            "Discriminant is wrong"
+        );
+        i += 1;
     }
 }
 
