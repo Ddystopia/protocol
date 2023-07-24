@@ -68,10 +68,9 @@ pub(crate) async fn handshake_active(
 pub(crate) async fn handshake_passive(socket: &UdpSocket) -> io::Result<Handshake> {
     'from_scratch: loop {
         let mut buf = [0; MTU];
-        let seq_num = SeqNum(5);
+        let seq_num = SeqNum(4);
 
         let (seq_num, addr) = 'listening_for_syn: loop {
-            println!("listening for syn tick");
             let Ok((len, addr)) = socket.recv_from(&mut buf).await else {
                 continue 'listening_for_syn;
             };
@@ -90,8 +89,6 @@ pub(crate) async fn handshake_passive(socket: &UdpSocket) -> io::Result<Handshak
         let mut timeout = Instant::now() + TIMEOUT;
 
         'awaiting_for_ack: loop {
-            println!("Awaiting for ack tick");
-
             let timeout_resut = time::timeout_at(timeout, socket.recv_from(&mut buf)).await;
 
             match timeout_resut {

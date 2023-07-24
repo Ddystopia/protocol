@@ -123,8 +123,12 @@ impl Receiver<'_> {
 }
 
 impl Message {
+    /// Creates a new message with the provided payload.
+    /// # Panics
+    /// Panics if the payload is bigger then 4GiB.
     #[must_use]
     pub fn file(payload: Vec<u8>, payload_size: u16, filename: String) -> Self {
+        assert!(u32::try_from(payload.len()).is_ok(), "Payload too big");
         Self {
             kind: MessageKind::File(filename),
             payload,
@@ -180,16 +184,13 @@ mod test {
     use super::*;
 
     #[tokio::test]
-    #[allow(clippy::diverging_sub_expression)]
-    #[allow(unreachable_code)]
     async fn hello_world() {
         const ADDR1: &str = "127.0.0.1:10201";
         const ADDR2: &str = "127.0.0.1:10202";
 
-        let size = 400 * 2usize.pow(20);
+        let size = 40 * 2usize.pow(20);
         let msg = Message::file(vec![5u8; size], 1496, "Ivakura.txt".to_string());
         let msg_clone = msg.clone();
-        dbg!("Here");
         let start = Instant::now();
 
         let h1 = tokio::spawn(async move {

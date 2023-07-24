@@ -54,11 +54,13 @@ enum PacketType {
 
 impl TryFrom<u8> for PacketType {
     type Error = ();
+    #[inline]
     fn try_from(value: u8) -> Result<Self, Self::Error> {
         try_from(value)
     }
 }
 
+#[inline]
 const fn try_from(value: u8) -> Result<PacketType, ()> {
     if value & !DISCRIMINANT_MASK != 0 {
         return Err(());
@@ -87,6 +89,7 @@ const fn try_from(value: u8) -> Result<PacketType, ()> {
     result
 }
 
+#[inline]
 fn string_from_null_terminated(buf: &[u8]) -> Result<Option<&str>, Utf8Error> {
     let name_end = buf.iter().take(22).position(|&x| x == 0).unwrap_or(23);
     if name_end == 0 {
@@ -117,6 +120,7 @@ impl<'a> Packet<'a> {
     }
 
     #[must_use]
+    #[inline]
     pub fn deserialize(bytes: &'a [u8]) -> Option<Self> {
         let discriminant = bytes[0] & DISCRIMINANT_MASK;
         let packet = match PacketType::try_from(discriminant).ok()? {
@@ -147,6 +151,7 @@ impl<'a> Packet<'a> {
         Some(packet)
     }
 
+    #[inline]
     pub fn serialize(&self, buf: &mut [u8]) -> usize {
         match self {
             Self::Init {
