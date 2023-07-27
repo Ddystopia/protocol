@@ -55,13 +55,13 @@ const DISCRIMINANT_MASK: u8 = 0xF0;
 //            function to include new one
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-enum PacketType {
+pub(crate) enum PacketType {
     Syn = 0b0111 << 4,
     SynAck = 0b1000 << 4,
     SynAckAck = 0b1011 << 4,
     Init = 0b0000 << 4,
     Data = 0b0001 << 4,
-    Ack = 0b0101 << 4,
+    DataOk = 0b0101 << 4,
     Nak = 0b0110 << 4,
     KeepAlive = 0b0010 << 4,
     InitOk = 0b0011 << 4,
@@ -89,7 +89,7 @@ const fn try_from(value: u8) -> Result<PacketType, ()> {
         0b1011 => Ok(PacketType::SynAckAck),
         0b0000 => Ok(PacketType::Init),
         0b0001 => Ok(PacketType::Data),
-        0b0101 => Ok(PacketType::Ack),
+        0b0101 => Ok(PacketType::DataOk),
         0b0110 => Ok(PacketType::Nak),
         0b0010 => Ok(PacketType::KeepAlive),
         0b0011 => Ok(PacketType::InitOk),
@@ -178,7 +178,7 @@ impl<'a> Packet<'a> {
                 seq_num: Self::decode_sequence(&bytes[0..4]),
                 data: &bytes[4..],
             }),
-            PacketType::Ack => Self::Recv(RecvPacket::DataAck(Self::decode_sequence(&bytes[0..4]))),
+            PacketType::DataOk => Self::Recv(RecvPacket::DataAck(Self::decode_sequence(&bytes[0..4]))),
             PacketType::Nak => Self::Recv(RecvPacket::Nak(Self::decode_sequence(&bytes[0..4]))),
             PacketType::KeepAlive => Self::Conn(ConnPacket::KeepAlive),
             PacketType::InitOk => Self::Recv(RecvPacket::InitOk),
@@ -256,7 +256,7 @@ impl<'a> Packet<'a> {
         let discriminant = match self {
             Self::Send(SendPacket::Init { .. }) => PacketType::Init,
             Self::Send(SendPacket::Data { .. }) => PacketType::Data,
-            Self::Recv(RecvPacket::DataAck(..)) => PacketType::Ack,
+            Self::Recv(RecvPacket::DataAck(..)) => PacketType::DataOk,
             Self::Recv(RecvPacket::Nak(..)) => PacketType::Nak,
             Self::Conn(ConnPacket::KeepAlive) => PacketType::KeepAlive,
             Self::Recv(RecvPacket::InitOk) => PacketType::InitOk,
@@ -289,7 +289,7 @@ const fn assert_constants() {
         PacketType::KeepAlive,
         PacketType::InitOk,
         PacketType::KeepAliveOk,
-        PacketType::Ack,
+        PacketType::DataOk,
         PacketType::Nak,
         PacketType::Fin,
         PacketType::FinOk,

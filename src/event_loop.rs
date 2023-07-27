@@ -18,6 +18,7 @@ use crate::{
     handshake::Handshake,
     packet::{
         ConnPacket::{self, KeepAlive, KeepAliveOk, Syn, SynAck, SynAckAck},
+        PacketType,
         RecvPacket::{self, DataAck, FinOk, InitOk, Nak},
         SendPacket::{self, Data, Fin, Init},
     },
@@ -187,23 +188,24 @@ pub(crate) async fn event_loop(
 
                     let seq_num = se.next_to_send;
 
-                    if seq_num == SeqNum(se.seq_num_count() as u32) {
-                        // What if NAK ?
-                        // Is race possible?
-                        if se.timeout_keys.is_empty() {
-                            let len = Fin.serialize(&mut buf);
-                            socket.send(&buf[..len]).await?;
-                            let key = timers.insert(DelayEvent::Fin, TIMEOUT);
-                            se.fin_timeout_key = Some(key);
-                        }
+                    // idk but with switched if it is faster. Maybe just a noise
+                    if seq_num != SeqNum(se.seq_num_count() as u32) {
+                        se.next_to_send += SeqNum(1);
+
+                        send_data_packet(&mut se, &socket, &mut buf, seq_num, &mut timers).await?;
+
                         sender = Some(se);
                         break 'block;
                     }
 
-                    se.next_to_send += SeqNum(1);
-
-                    send_data_packet(&mut se, &socket, &mut buf, seq_num, &mut timers).await?;
-
+                    // What if NAK ?
+                    // Is race possible?
+                    if se.timeout_keys.is_empty() {
+                        let len = Fin.serialize(&mut buf);
+                        socket.send(&buf[..len]).await?;
+                        let key = timers.insert(DelayEvent::Fin, TIMEOUT);
+                        se.fin_timeout_key = Some(key);
+                    }
                     sender = Some(se);
                 }
 
@@ -269,17 +271,24 @@ pub(crate) async fn event_loop(
 
             Sig::Recv(sig) => match (sig, reader) {
                 (RecvSig::Packet(Data { seq_num, data }), Some(mut re)) => {
-                    let payload_size = re.payload_size;
                     // TODO: Nak maybe?
                     debug_assert!(
-                        data.len() <= payload_size,
+                        data.len() <= re.payload_size,
                         "Data packet size is bigger then payload_size",
                     );
-                    let bytes_before = seq_num.0 as usize * payload_size;
+
+                    let bytes_before = seq_num.0 as usize * re.payload_size;
                     re.recv_bytes[bytes_before..][..data.len()].copy_from_slice(data);
-                    let len = DataAck(seq_num).serialize(&mut buf);
-                    socket.send(&buf[..len]).await?;
                     reader = Some(re);
+
+                    // A bit slover version
+                    // let mut local_buf = [0; 4];
+                    // DataAck(seq_num).serialize(&mut local_buf);
+                    // socket.send(&local_buf[..4]).await?;
+
+                    // A bit faster version. It is so ugly that I whould verify it again.
+                    buf[0] |= PacketType::DataOk as u8 & !(PacketType::Data as u8);
+                    socket.send(&buf[..4]).await?;
                 }
 
                 // Receiver

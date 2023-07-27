@@ -21,9 +21,9 @@ use tokio::{
 
 use handshake::Handshake;
 
-pub(crate) const MTU: usize = 1500;
+pub(crate) const MTU: usize = 1500 - 8;
 
-pub(crate) const TIMEOUT: Duration = Duration::from_millis(100);
+pub(crate) const TIMEOUT: Duration = Duration::from_millis(50);
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 enum MessageKind {
@@ -123,11 +123,11 @@ impl Message {
     /// Creates a new message with the provided payload.
     /// # Panics
     /// - If the total transfer size is bigger then 4GiB.
-    /// - If the payload size is bigger then 1460 bytes.
+    /// - If the payload size is bigger then 1488 bytes.
     #[must_use]
     pub fn file(payload: Vec<u8>, payload_size: u16, filename: String) -> Self {
         assert!(u32::try_from(payload.len()).is_ok(), "Payload too big");
-        assert!(payload_size <= MTU as u16 - 40, "Payload too big");
+        assert!(payload_size <= MTU as u16 - 4, "Payload too big");
         Self {
             kind: MessageKind::File(filename),
             payload,
