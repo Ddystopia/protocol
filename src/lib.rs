@@ -1,15 +1,15 @@
 #![allow(clippy::missing_errors_doc)]
 
-// TODO: PGO
-
 mod event_loop;
 mod handshake;
 mod packet;
 
-use std::{io, sync::{Arc, atomic::AtomicBool}, time::Duration};
-use std::sync::atomic::Ordering::Relaxed;
+use std::{
+    io,
+    sync::{atomic::{AtomicBool, Ordering::Relaxed}, Arc},
+    time::Duration,
+};
 
-use handshake::Handshake;
 use tokio::{
     net::{ToSocketAddrs, UdpSocket},
     sync::{
@@ -18,6 +18,8 @@ use tokio::{
     },
     task::JoinHandle,
 };
+
+use handshake::Handshake;
 
 pub(crate) const MTU: usize = 1500;
 
@@ -50,11 +52,6 @@ pub struct Connection {
 
 pub struct Receiver<'a>(&'a mut mpsc::Receiver<Message>);
 
-//  TODO: Replace mpsc with channel of capacity 1 that not dies as oneshot
-//        Maybe write my own, "Atomics and Locks" is a great book
-//        `AtomicPtr`?
-//  ^^^^^ I think it is not worth it, that channel still has capacity 1
-//        And does not grow.
 pub struct Sender<'a> {
     sender: &'a mut mpsc::Sender<Message>,
     signal: &'a Notify,
@@ -125,10 +122,12 @@ impl Receiver<'_> {
 impl Message {
     /// Creates a new message with the provided payload.
     /// # Panics
-    /// Panics if the payload is bigger then 4GiB.
+    /// - If the total transfer size is bigger then 4GiB.
+    /// - If the payload size is bigger then 1460 bytes.
     #[must_use]
     pub fn file(payload: Vec<u8>, payload_size: u16, filename: String) -> Self {
         assert!(u32::try_from(payload.len()).is_ok(), "Payload too big");
+        assert!(payload_size <= MTU as u16 - 40, "Payload too big");
         Self {
             kind: MessageKind::File(filename),
             payload,
@@ -189,7 +188,11 @@ mod test {
         const ADDR2: &str = "127.0.0.1:10202";
 
         let size = 40 * 2usize.pow(20);
-        let msg = Message::file(vec![5u8; size], 1496, "Ivakura.txt".to_string());
+        let mut data = vec![0; size];
+        for (i, x) in data.iter_mut().enumerate() {
+            *x = (i % 256) as u8;
+        }
+        let msg = Message::file(data, 1460, "Ivakura.txt".to_string());
         let msg_clone = msg.clone();
         let start = Instant::now();
 
@@ -207,13 +210,13 @@ mod test {
         });
 
         let (r1, r2) = tokio::join!(h1, h2);
-        let end = Instant::now();
+        let duration = start.elapsed();
         r1.unwrap().unwrap();
         let transfered_message = r2.unwrap().unwrap();
         assert_eq!(transfered_message, msg);
         println!(
             "Speed: {}Mib/sec",
-            (size / 1000 * 8) / (end - start).as_millis() as usize
+            (size / 1000 * 8) / duration.as_millis() as usize
         );
     }
 }

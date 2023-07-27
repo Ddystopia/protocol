@@ -1,20 +1,12 @@
-use std::sync::atomic::Ordering::Relaxed;
 use std::{
-    collections::HashMap,
     io::ErrorKind,
-    sync::{atomic::AtomicBool, Arc},
-};
-
-use crate::{
-    handshake::Handshake,
-    packet::Packet::{
-        Ack, Data, Fin, FinOk, Init, InitOk, KeepAlive, KeepAliveOk, Nak, Syn, SynAck,
+    sync::{
+        atomic::{AtomicBool, Ordering::Relaxed},
+        Arc,
     },
-    packet::{Packet, SeqNum},
-    MessageKind, MTU, TIMEOUT,
 };
 
-const WINDOW_SIZE: usize = 128;
+use rustc_hash::FxHashMap;
 
 use tokio::{
     net::UdpSocket,
@@ -22,30 +14,58 @@ use tokio::{
 };
 use tokio_util::time::{delay_queue::Key, DelayQueue};
 
-use crate::Message;
+use crate::{
+    handshake::Handshake,
+    packet::{
+        ConnPacket::{self, KeepAlive, KeepAliveOk, Syn, SynAck, SynAckAck},
+        RecvPacket::{self, DataAck, FinOk, InitOk, Nak},
+        SendPacket::{self, Data, Fin, Init},
+    },
+    packet::{Packet, SeqNum},
+    Message, MessageKind, MTU, TIMEOUT,
+};
+
+const WINDOW_SIZE: usize = 128;
 
 #[allow(unused_macros)]
 macro_rules! debug {
     ($reader:ident, $sender:ident, $sig:ident) => {
-        let reader = match &$reader {
-            Some(_) => "Reader",
-            None => "",
+        let side = match (&$reader, &$sender) {
+            (Some(_), None) => "Reader",
+            (None, Some(_)) => "Sender",
+            (Some(_), Some(_)) => "Reader & Sender"
+            (None, None) => "Empty"
         };
-        let sender = match &$sender {
-            Some(_) => "Sender",
-            None => "",
-        };
-        dbg!(reader, sender, &$sig);
+        dbg!(side, &$sig);
     };
 }
 
 #[derive(Debug)]
 enum Sig<'a> {
-    Packet(Packet<'a>),
-    Timeout(DelayEvent),
+    Conn(ConnSig),
+    Recv(RecvSig<'a>),
+    Send(SendSig),
+}
+
+#[derive(Debug)]
+enum ConnSig {
+    Packet(ConnPacket),
     SocketError(std::io::Error),
-    StartSendingFile(Message),
     KeepAlive,
+    KeepAliveExpired,
+}
+
+#[derive(Debug)]
+enum RecvSig<'a> {
+    Packet(SendPacket<'a>),
+}
+
+#[derive(Debug)]
+enum SendSig {
+    Packet(RecvPacket),
+    FinExpired,
+    AckExpired(SeqNum),
+    StartSendingFile(Message),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -57,7 +77,7 @@ enum DelayEvent {
 
 struct SendState {
     message: Message,
-    timeout_keys: HashMap<SeqNum, Key>,
+    timeout_keys: FxHashMap<SeqNum, Key>,
     fin_timeout_key: Option<Key>,
     next_to_send: SeqNum,
 }
@@ -86,222 +106,230 @@ pub(crate) async fn event_loop(
     mut api_sender_rx: mpsc::Receiver<Message>,
     api_received_messages_tx: mpsc::Sender<Message>,
 ) -> std::io::Result<UdpSocket> {
-    let mut timers = DelayQueue::new();
     let mut buf = [0; MTU];
     let mut reader: Option<ReceiveState> = None;
     let mut sender: Option<SendState> = None;
+    let mut timers = DelayQueue::new();
     let mut keep_alive_key = None;
 
     'event_loop: loop {
-        // dbg!("Event loop tick");
         let delay_event = futures::future::poll_fn(|cx| timers.poll_expired(cx));
         let sig = tokio::select! {
             biased;
-            _ = async {}, if shutdown.load(Relaxed) => return Ok(socket),
-            Some(expired) = delay_event => Sig::Timeout(expired.into_inner()),
+
+            _ = async { /* would not react immediately */},
+                if shutdown.load(Relaxed) => return Ok(socket),
+
+            Some(expired) = delay_event => match expired.into_inner() {
+                DelayEvent::Ack(s) => Sig::Send(SendSig::AckExpired(s)),
+                DelayEvent::Fin => Sig::Send(SendSig::FinExpired),
+                DelayEvent::KeepAliveExpired => Sig::Conn(ConnSig::KeepAliveExpired),
+            },
+
             socket_res = socket.recv(&mut buf) => match socket_res {
                 Ok(len) => match Packet::deserialize(&buf[..len]) {
-                    Some(packet) => Sig::Packet(packet),
+                    Some(Packet::Conn(p)) => Sig::Conn(ConnSig::Packet(p)),
+                    Some(Packet::Send(p)) => Sig::Recv(RecvSig::Packet(p)),
+                    Some(Packet::Recv(p)) => Sig::Send(SendSig::Packet(p)),
                     None => continue 'event_loop,
                 }
-                Err(e) => Sig::SocketError(e)
+                Err(e) => Sig::Conn(ConnSig::SocketError(e))
             },
+
             msg = api_sender_rx.recv() => {
-                Sig::StartSendingFile(msg.expect("API sender channel closed"))
+                Sig::Send(SendSig::StartSendingFile(msg.expect("API sender channel closed")))
             }
-            _ = tokio::time::sleep(TIMEOUT) => Sig::KeepAlive,
+
+            _ = tokio::time::sleep(TIMEOUT) => Sig::Conn(ConnSig::KeepAlive)
         };
 
-        // debug!(reader, sender, sig);
+        match sig {
+            Sig::Conn(sig) => match sig {
+                ConnSig::Packet(Syn | SynAckAck(_)) => (),
 
-        (reader, sender) = match (sig, reader, sender) {
-            // The hottest path for reader
-            (Sig::Packet(Data { seq_num, data }), Some(mut re), s) => {
-                let payload_size = re.payload_size;
-                // TODO: Nak maybe?
-                debug_assert!(
-                    data.len() <= payload_size,
-                    "Data packet size is bigger then payload_size",
-                );
-                let bytes_before = seq_num.0 as usize * payload_size;
-                re.recv_bytes[bytes_before..][..data.len()].copy_from_slice(data);
-                let len = Packet::Ack(seq_num).serialize(&mut buf);
-                socket.send(&buf[..len]).await?;
-                (Some(re), s)
-            }
-
-            // The hottest path for sender
-            (Sig::Packet(Ack(seq_num_ack)), r, Some(mut se)) => 'block: {
-                timers.remove(&se.timeout_keys.remove(&seq_num_ack).unwrap());
-
-                let seq_num = se.next_to_send;
-
-                if seq_num == SeqNum(se.seq_num_count() as u32) {
-                    // What if NAK ?
-                    // Is race possible?
-                    if se.timeout_keys.is_empty() {
-                        let len = Packet::Fin.serialize(&mut buf);
-                        socket.send(&buf[..len]).await?;
-                        let key = timers.insert(DelayEvent::Fin, TIMEOUT);
-                        se.fin_timeout_key = Some(key);
-                    }
-                    break 'block (r, Some(se));
+                ConnSig::Packet(SynAck(seq_num)) => {
+                    let len = RecvPacket::DataAck(seq_num).serialize(&mut buf);
+                    socket.send(&buf[..len]).await?;
                 }
 
-                se.next_to_send += SeqNum(1);
+                ConnSig::Packet(KeepAlive) => {
+                    let len = ConnPacket::KeepAliveOk.serialize(&mut buf);
+                    socket.send(&buf[..len]).await?;
+                }
 
-                send_data_packet(&mut se, &socket, &mut buf, seq_num, &mut timers).await?;
+                ConnSig::KeepAliveExpired => {
+                    return Ok(socket);
+                }
 
-                (r, Some(se))
-            }
+                ConnSig::KeepAlive => {
+                    let len = ConnPacket::KeepAlive.serialize(&mut buf);
+                    socket.send(&buf[..len]).await?;
+                    let key = timers.insert(DelayEvent::KeepAliveExpired, TIMEOUT);
+                    keep_alive_key = Some(key);
+                }
 
-            // Receiver
-            (Sig::Packet(Fin), Some(re), s) => {
-                let len = Packet::FinOk.serialize(&mut buf);
-                socket.send(&buf[..len]).await?;
-
-                let message = Message {
-                    payload: re.recv_bytes,
-                    payload_size: re.payload_size as u16,
-                    kind: match re.name {
-                        Some(name) => MessageKind::File(name),
-                        None => MessageKind::Text,
-                    },
-                };
-
-                api_received_messages_tx
-                    .send(message)
-                    .await
-                    .expect("TODO: convert to io error");
-
-                (None, s)
-            }
-            #[rustfmt::skip]
-            (Sig::Packet(Init { payload, transfer, name }), re, s) => 'b: {
-                if let Some(r) = re {
-                    if !(r.recv_bytes.len() == transfer as usize
-                        && r.payload_size == payload as usize
-                        && r.name.as_ref().zip(name).map_or(true, |(a, b)| a == b))
-                    {
-                        break 'b (Some(r), s);
+                ConnSig::Packet(KeepAliveOk) => {
+                    if let Some(key) = keep_alive_key {
+                        timers.remove(&key);
                     }
                 }
 
-                let name = name.map(|s| s.to_string());
-
-                let len = Packet::InitOk.serialize(&mut buf);
-                socket.send(&buf[..len]).await?;
-
-                let reader = Some(ReceiveState {
-                    recv_bytes: vec![0; transfer as usize],
-                    payload_size: payload as usize,
-                    name,
-                });
-
-                (reader, s)
-            }
-
-            (Sig::SocketError(e), _, _) => match e.kind() {
-                ErrorKind::ConnectionReset | ErrorKind::ConnectionAborted => return Ok(socket),
-                _ => return Err(e),
+                ConnSig::SocketError(e) => match e.kind() {
+                    ErrorKind::ConnectionReset | ErrorKind::ConnectionAborted => return Ok(socket),
+                    ErrorKind::ConnectionRefused => todo!("Idk why but it happens"),
+                    _ => return Err(e),
+                },
             },
 
-            // Sender
-            (Sig::Timeout(DelayEvent::Fin), r, Some(mut se)) => {
-                let len = Packet::Fin.serialize(&mut buf);
-                socket.send(&buf[..len]).await?;
-                let key = timers.insert(DelayEvent::Fin, TIMEOUT);
-                se.fin_timeout_key = Some(key);
-                (r, Some(se))
-            }
-            (Sig::Packet(FinOk), r, Some(mut se)) => {
-                if se.fin_timeout_key.take().is_some() {
-                    api_sender_notify_tx.notify_waiters();
-                    (r, None)
-                } else {
-                    (r, Some(se))
-                }
-            }
-            (Sig::StartSendingFile(message), r, None) => {
-                let packet = Packet::Init {
-                    payload: message.payload_size,
-                    transfer: message.payload.len() as u32,
-                    name: match &message.kind {
-                        MessageKind::File(name) => Some(name),
-                        MessageKind::Text => None,
-                    },
-                };
-                let len = packet.serialize(&mut buf);
-                socket.send(&buf[..len]).await?;
-                let sender = Some(SendState {
-                    message,
-                    timeout_keys: HashMap::default(),
-                    next_to_send: SeqNum(0),
-                    fin_timeout_key: None,
-                });
-                (r, sender)
-            }
+            Sig::Send(sig) => match (sig, sender) {
+                (SendSig::Packet(DataAck(seq_num_ack)), Some(mut se)) => 'block: {
+                    timers.remove(&se.timeout_keys.remove(&seq_num_ack).unwrap());
 
-            (Sig::Packet(InitOk), r, Some(mut se)) => {
-                let send_count = WINDOW_SIZE.min(se.seq_num_count());
-                for left in 0..send_count {
-                    let seq_num = SeqNum(left as u32);
+                    let seq_num = se.next_to_send;
+
+                    if seq_num == SeqNum(se.seq_num_count() as u32) {
+                        // What if NAK ?
+                        // Is race possible?
+                        if se.timeout_keys.is_empty() {
+                            let len = Fin.serialize(&mut buf);
+                            socket.send(&buf[..len]).await?;
+                            let key = timers.insert(DelayEvent::Fin, TIMEOUT);
+                            se.fin_timeout_key = Some(key);
+                        }
+                        sender = Some(se);
+                        break 'block;
+                    }
+
+                    se.next_to_send += SeqNum(1);
+
                     send_data_packet(&mut se, &socket, &mut buf, seq_num, &mut timers).await?;
+
+                    sender = Some(se);
                 }
-                se.next_to_send = SeqNum(send_count as u32);
 
-                (r, Some(se))
-            }
-
-            (
-                Sig::Packet(Nak(seq_num)) | Sig::Timeout(DelayEvent::Ack(seq_num)),
-                r,
-                Some(mut se),
-            ) => {
-                send_data_packet(&mut se, &socket, &mut buf, seq_num, &mut timers).await?;
-
-                (r, Some(se))
-            }
-
-            // Shared
-            (Sig::Packet(Syn), r, s) => (r, s),
-            (Sig::Packet(SynAck(seq_num)), r, s) => {
-                let len = Packet::Ack(seq_num).serialize(&mut buf);
-                socket.send(&buf[..len]).await?;
-                (r, s)
-            }
-            (Sig::StartSendingFile(_), _, Some(_)) => panic!("Should not send file in parallel."),
-            (Sig::Packet(KeepAlive), r, s) => {
-                let len = Packet::KeepAliveOk.serialize(&mut buf);
-                socket.send(&buf[..len]).await?;
-                (r, s)
-            }
-            (
-                Sig::Timeout(DelayEvent::Fin) | Sig::Packet(InitOk | FinOk | Ack(_) | Nak(_)),
-                r,
-                None,
-            ) => (r, None),
-            (Sig::Timeout(DelayEvent::Ack(_)), _, None) => {
-                panic!("Delay events should be cleared properly.")
-            }
-            (Sig::Packet(Data { .. } | Fin), None, s) => (None, s),
-            (Sig::Timeout(DelayEvent::KeepAliveExpired), _r, _s) => {
-                return Ok(socket);
-            }
-
-            (Sig::KeepAlive, r, s) => {
-                let len = Packet::KeepAlive.serialize(&mut buf);
-                socket.send(&buf[..len]).await?;
-                let key = timers.insert(DelayEvent::KeepAliveExpired, TIMEOUT);
-                keep_alive_key = Some(key);
-                (r, s)
-            }
-            (Sig::Packet(KeepAliveOk), r, s) => {
-                if let Some(key) = keep_alive_key {
-                    timers.remove(&key);
+                (SendSig::FinExpired, Some(mut se)) => {
+                    let len = Fin.serialize(&mut buf);
+                    socket.send(&buf[..len]).await?;
+                    let key = timers.insert(DelayEvent::Fin, TIMEOUT);
+                    se.fin_timeout_key = Some(key);
+                    sender = Some(se);
                 }
-                (r, s)
-            }
+
+                (SendSig::Packet(FinOk), Some(mut se)) => {
+                    sender = if se.fin_timeout_key.take().is_some() {
+                        api_sender_notify_tx.notify_waiters();
+                        None
+                    } else {
+                        Some(se)
+                    };
+                }
+
+                (SendSig::StartSendingFile(message), None) => {
+                    let packet = Init {
+                        payload: message.payload_size,
+                        transfer: message.payload.len() as u32,
+                        name: match &message.kind {
+                            MessageKind::File(name) => Some(name),
+                            MessageKind::Text => None,
+                        },
+                    };
+                    let len = packet.serialize(&mut buf);
+                    socket.send(&buf[..len]).await?;
+                    sender = Some(SendState {
+                        message,
+                        timeout_keys: FxHashMap::default(),
+                        next_to_send: SeqNum(0),
+                        fin_timeout_key: None,
+                    });
+                }
+
+                (SendSig::Packet(InitOk), Some(mut se)) => {
+                    let send_count = WINDOW_SIZE.min(se.seq_num_count());
+                    for left in 0..send_count {
+                        let seq_num = SeqNum(left as u32);
+                        send_data_packet(&mut se, &socket, &mut buf, seq_num, &mut timers).await?;
+                    }
+                    se.next_to_send = SeqNum(send_count as u32);
+
+                    sender = Some(se);
+                }
+
+                (SendSig::Packet(Nak(seq_num)) | SendSig::AckExpired(seq_num), Some(mut se)) => {
+                    send_data_packet(&mut se, &socket, &mut buf, seq_num, &mut timers).await?;
+
+                    sender = Some(se);
+                }
+
+                (_, None) => sender = None,
+
+                (SendSig::StartSendingFile(_), Some(_)) => {
+                    panic!("Should not send file in parallel.")
+                }
+            },
+
+            Sig::Recv(sig) => match (sig, reader) {
+                (RecvSig::Packet(Data { seq_num, data }), Some(mut re)) => {
+                    let payload_size = re.payload_size;
+                    // TODO: Nak maybe?
+                    debug_assert!(
+                        data.len() <= payload_size,
+                        "Data packet size is bigger then payload_size",
+                    );
+                    let bytes_before = seq_num.0 as usize * payload_size;
+                    re.recv_bytes[bytes_before..][..data.len()].copy_from_slice(data);
+                    let len = DataAck(seq_num).serialize(&mut buf);
+                    socket.send(&buf[..len]).await?;
+                    reader = Some(re);
+                }
+
+                // Receiver
+                (RecvSig::Packet(Fin), Some(re)) => {
+                    let len = FinOk.serialize(&mut buf);
+                    socket.send(&buf[..len]).await?;
+
+                    let message = Message {
+                        payload: re.recv_bytes,
+                        payload_size: re.payload_size as u16,
+                        kind: match re.name {
+                            Some(name) => MessageKind::File(name),
+                            None => MessageKind::Text,
+                        },
+                    };
+
+                    api_received_messages_tx
+                        .send(message)
+                        .await
+                        .expect("TODO: convert to io error");
+
+                    reader = None;
+                }
+
+                #[rustfmt::skip]
+                (RecvSig::Packet(Init { payload, transfer, name }), re) => 'b: {
+                    if let Some(r) = re {
+                        if !(r.recv_bytes.len() == transfer as usize
+                            && r.payload_size == payload as usize
+                            && r.name.as_ref().zip(name).map_or(true, |(a, b)| a == b))
+                        {
+                            reader = Some(r);
+                            break 'b;
+                        }
+                    }
+
+                    let name = name.map(|s| s.to_string());
+
+                    let len = InitOk.serialize(&mut buf);
+                    socket.send(&buf[..len]).await?;
+
+                    reader = Some(ReceiveState {
+                        recv_bytes: vec![0; transfer as usize],
+                        payload_size: payload as usize,
+                        name,
+                    });
+                }
+
+                (RecvSig::Packet(_), None) => reader = None,
+            },
         }
     }
 }
@@ -322,7 +350,7 @@ async fn send_data_packet(
 
     let next_bytes = &msg.payload[bytes_before..];
 
-    let len = Packet::Data {
+    let len = Data {
         seq_num,
         data: &next_bytes[..payload_size.min(next_bytes.len())],
     }

@@ -1,13 +1,13 @@
-use std::io;
-use std::io::ErrorKind;
+use std::io::{self, ErrorKind};
 use std::net::SocketAddr;
 
 use tokio::net::{ToSocketAddrs, UdpSocket};
 use tokio::time::{self, Instant};
 
-use crate::packet::Packet;
-use crate::TIMEOUT;
-use crate::{packet::SeqNum, MTU};
+use crate::{
+    packet::{ConnPacket, Packet, SeqNum},
+    MTU, TIMEOUT,
+};
 
 mod private {
     #[derive(Debug, Clone, Copy)]
@@ -25,30 +25,25 @@ pub(crate) async fn handshake_active(
     socket.connect(addr).await?;
     let mut buf = [0; MTU];
 
-    println!("sending syn");
-
-    let len = Packet::Syn.serialize(&mut buf);
+    let len = ConnPacket::Syn.serialize(&mut buf);
     socket.send(&buf[..len]).await?;
 
     let mut timeout = Instant::now() + TIMEOUT;
 
     let seq_num = 'awaiting_for_syn_ack: loop {
-        println!("awaiting for syn_ack");
-
         let timeout_result = time::timeout_at(timeout, socket.recv(&mut buf)).await;
         match timeout_result {
             Ok(Ok(len)) => {
                 let Some(packet) = Packet::deserialize(&buf[..len]) else {
                     continue 'awaiting_for_syn_ack;
                 };
-                if let Packet::SynAck(seq_num) = packet {
+                if let Packet::Conn(ConnPacket::SynAck(seq_num)) = packet {
                     break 'awaiting_for_syn_ack seq_num;
                 }
             }
             Ok(Err(e)) => return Err(e),
             Err(_elapsed) => {
-                let syn = Packet::Syn;
-                let len = syn.serialize(&mut buf);
+                let len = ConnPacket::Syn.serialize(&mut buf);
                 socket.send(&buf[..len]).await?;
 
                 timeout = Instant::now() + TIMEOUT;
@@ -56,7 +51,7 @@ pub(crate) async fn handshake_active(
         }
     };
 
-    let len = Packet::Ack(seq_num).serialize(&mut buf);
+    let len = ConnPacket::SynAckAck(seq_num).serialize(&mut buf);
     socket.send(&buf[..len]).await?;
 
     // NA: event loop should keep responing acks to SYN_ACKs
@@ -78,8 +73,8 @@ pub(crate) async fn handshake_passive(socket: &UdpSocket) -> io::Result<Handshak
                 continue 'listening_for_syn;
             };
 
-            if let Packet::Syn = packet {
-                let syn_ack = Packet::SynAck(seq_num);
+            if let Packet::Conn(ConnPacket::Syn) = packet {
+                let syn_ack = ConnPacket::SynAck(seq_num);
                 let len = syn_ack.serialize(&mut buf);
                 socket.send_to(&buf[..len], addr).await?;
                 break 'listening_for_syn (seq_num, addr);
@@ -93,11 +88,13 @@ pub(crate) async fn handshake_passive(socket: &UdpSocket) -> io::Result<Handshak
 
             match timeout_resut {
                 Ok(Ok((len, a))) => match Packet::deserialize(&buf[..len]) {
-                    Some(Packet::Ack(seq_num_i)) if seq_num == seq_num_i && addr == a => {
+                    Some(Packet::Conn(ConnPacket::SynAckAck(seq_num_i)))
+                        if seq_num == seq_num_i && addr == a =>
+                    {
                         break 'awaiting_for_ack
                     }
-                    Some(Packet::Syn) => {
-                        let syn_ack = Packet::SynAck(seq_num);
+                    Some(Packet::Conn(ConnPacket::Syn)) => {
+                        let syn_ack = ConnPacket::SynAck(seq_num);
                         let len = syn_ack.serialize(&mut buf);
                         socket.send_to(&buf[..len], addr).await?;
                         continue 'awaiting_for_ack;
@@ -108,11 +105,11 @@ pub(crate) async fn handshake_passive(socket: &UdpSocket) -> io::Result<Handshak
                     ErrorKind::ConnectionReset | ErrorKind::ConnectionAborted => {
                         continue 'from_scratch
                     }
+                    ErrorKind::ConnectionRefused => todo!("Idk why but it happens"),
                     _ => return Err(e),
                 },
                 Err(_elapsed) => {
-                    let syn_ack = Packet::SynAck(seq_num);
-                    let len = syn_ack.serialize(&mut buf);
+                    let len = ConnPacket::SynAck(seq_num).serialize(&mut buf);
                     socket.send(&buf[..len]).await?;
                     timeout = Instant::now() + TIMEOUT;
                 }
@@ -131,14 +128,14 @@ enum StatePassive {
 }
 
 #[derive(Debug)]
-enum PassiveSignal<'a> {
-    Packet(Packet<'a>, SocketAddr),
+enum PassiveSignal {
+    Packet(ConnPacket, SocketAddr),
     Error(std::io::Error),
     Timeout,
 }
 
 #[allow(dead_code)]
-async fn handshake_passive_sm(socket: &UdpSocket) -> io::Result<Handshake> {
+pub(crate) async fn handshake_passive_sm(socket: &UdpSocket) -> io::Result<Handshake> {
     use PassiveSignal as Sig;
     use StatePassive as State;
 
@@ -154,8 +151,8 @@ async fn handshake_passive_sm(socket: &UdpSocket) -> io::Result<Handshake> {
         };
         let signal = match result {
             Ok(Ok((len, addr))) => match Packet::deserialize(&buf[..len]) {
-                Some(packet) => Sig::Packet(packet, addr),
-                None => continue,
+                Some(Packet::Conn(packet)) => Sig::Packet(packet, addr),
+                _ => continue,
             },
             Ok(Err(e)) => Sig::Error(e),
             Err(_elapsed) => Sig::Timeout,
@@ -164,7 +161,7 @@ async fn handshake_passive_sm(socket: &UdpSocket) -> io::Result<Handshake> {
         match (state, signal) {
             (
                 State::GotSynSentSynAckWaitingForAck(seq_num, addr),
-                Sig::Packet(Packet::Ack(s), a),
+                Sig::Packet(ConnPacket::SynAckAck(s), a),
             ) => {
                 if s != seq_num || a != addr {
                     continue;
@@ -172,11 +169,10 @@ async fn handshake_passive_sm(socket: &UdpSocket) -> io::Result<Handshake> {
                 socket.connect(addr).await?;
                 return Ok(Handshake(private::PrivateZst));
             }
-            (State::GotSynSentSynAckWaitingForAck(_, addr), Sig::Packet(Packet::Syn, a)) |
-            (State::Listening, Sig::Packet(Packet::Syn, addr @ a)) |
+            (State::GotSynSentSynAckWaitingForAck(_, addr), Sig::Packet(ConnPacket::Syn, a)) |
+            (State::Listening, Sig::Packet(ConnPacket::Syn, addr @ a)) |
             (State::GotSynSentSynAckWaitingForAck(_, addr @ a), Sig::Timeout) => if addr == a {
-                let syn_ack = Packet::SynAck(seq_num);
-                let len = syn_ack.serialize(&mut buf);
+                let len = ConnPacket::SynAck(seq_num).serialize(&mut buf);
                 socket.send_to(&buf[..len], addr).await?;
                 at = Some(Instant::now() + TIMEOUT);
                 state = State::GotSynSentSynAckWaitingForAck(seq_num, addr);
@@ -188,6 +184,7 @@ async fn handshake_passive_sm(socket: &UdpSocket) -> io::Result<Handshake> {
                     at = None;
                     state = State::Listening;
                 },
+                ErrorKind::ConnectionRefused => todo!("Idk why but it happens"),
                 _ => return Err(e),
             }
 
@@ -224,7 +221,8 @@ mod test {
             handshake_active(&socket1, ADDR2.clone()).await
         });
 
-        let hs2 = tokio::spawn(async move { handshake_passive_sm(&socket2).await });
+        let hs2 = tokio::spawn(async move { handshake_passive(&socket2).await });
+        // let hs2 = tokio::spawn(async move { handshake_passive_sm(&socket2).await });
 
         let (r1, r2) = tokio::join!(hs1, hs2);
         r1.unwrap().unwrap();
@@ -240,6 +238,7 @@ mod test {
         let socket2 = UdpSocket::bind(ADDR2).await.unwrap();
 
         let hs1 = tokio::spawn(async move { handshake_active(&socket1, ADDR2).await });
+        // let hs2 = tokio::spawn(async move { handshake_passive(&socket2).await });
         let hs2 = tokio::spawn(async move { handshake_passive_sm(&socket2).await });
 
         let (r1, r2) = tokio::join!(hs1, hs2);

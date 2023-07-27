@@ -1,13 +1,14 @@
-use protocol::{Message, Server};
 use tokio::time::Instant;
+
+use protocol::{Message, Server};
 
 #[tokio::main]
 async fn main() {
     const ADDR1: &str = "127.0.0.1:6201";
     const ADDR2: &str = "127.0.0.1:6202";
 
-    let size = 400 * 2usize.pow(20);
-    let msg = Message::file(vec![5u8; size], 1496, "Ivakura.txt".to_string());
+    let size = 4000 * 2usize.pow(20);
+    let msg = Message::file(vec![5u8; size], 1460, "Ivakura.txt".to_string());
     let msg_clone = msg.clone();
     let start = Instant::now();
 
@@ -25,12 +26,12 @@ async fn main() {
     });
 
     let (r1, r2) = tokio::join!(h1, h2);
-    let end = Instant::now();
+    let duration = start.elapsed();
     r1.unwrap().unwrap();
     let transfered_message = r2.unwrap().unwrap();
     assert_eq!(transfered_message, msg, "Message is corrupted");
     println!(
         "Speed: {}Mib/sec",
-        (size / 1000 * 8) / (end - start).as_millis() as usize
+        (size / 1000 * 8) / duration.as_millis() as usize
     );
 }

@@ -6,23 +6,21 @@ edition = "2021"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [profile.release]
+codegen-units = 1
 opt-level = 3
 lto = true
 
 [dependencies]
 futures = "0.3.28"
-# tokio-scoped = "0.2.0"
+rustc-hash = "1.1.0"
 tokio-util = { version = "0.7.8", features = ["time"] }
+# tokio-scoped = "0.2.0"
 
 [dependencies.tokio]
 version = "1.29.1"
 features = [
   "rt",
   "rt-multi-thread",
-  "io-util",
-  "io-std",
   "net",
-  "time",
   "macros",
-  "sync"
 ]

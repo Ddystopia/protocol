@@ -1,7 +1,4 @@
-#![allow(dead_code)]
-
 use std::{ops::AddAssign, str::Utf8Error};
-const MTU: usize = 1500;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct SeqNum(pub u32);
@@ -12,10 +9,25 @@ impl AddAssign for SeqNum {
     }
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Packet<'a> {
+    Conn(ConnPacket),
+    Send(SendPacket<'a>),
+    Recv(RecvPacket),
+}
+
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub enum ConnPacket {
     Syn,
     SynAck(SeqNum),
+    SynAckAck(SeqNum),
+    KeepAlive,
+    KeepAliveOk,
+}
+
+/// Packet that Sender sends to Receiver
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub enum SendPacket<'a> {
     Init {
         payload: u16,
         transfer: u32,
@@ -25,22 +37,28 @@ pub enum Packet<'a> {
         seq_num: SeqNum,
         data: &'a [u8],
     },
-    Ack(SeqNum),
-    Nak(SeqNum),
-    KeepAlive,
-    InitOk,
-    KeepAliveOk,
     Fin,
+}
+
+/// Packet that Receiver sends to Sender
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub enum RecvPacket {
+    DataAck(SeqNum),
+    Nak(SeqNum),
+    InitOk,
     FinOk,
 }
 
 const DISCRIMINANT_MASK: u8 = 0xF0;
 
+// IMPORTANT: When adding new packet types, update `assert_constant`
+//            function to include new one
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 enum PacketType {
     Syn = 0b0111 << 4,
     SynAck = 0b1000 << 4,
+    SynAckAck = 0b1011 << 4,
     Init = 0b0000 << 4,
     Data = 0b0001 << 4,
     Ack = 0b0101 << 4,
@@ -68,6 +86,7 @@ const fn try_from(value: u8) -> Result<PacketType, ()> {
     let result = match value >> 4 {
         0b0111 => Ok(PacketType::Syn),
         0b1000 => Ok(PacketType::SynAck),
+        0b1011 => Ok(PacketType::SynAckAck),
         0b0000 => Ok(PacketType::Init),
         0b0001 => Ok(PacketType::Data),
         0b0101 => Ok(PacketType::Ack),
@@ -98,6 +117,27 @@ fn string_from_null_terminated(buf: &[u8]) -> Result<Option<&str>, Utf8Error> {
     std::str::from_utf8(&buf[..name_end]).map(Some)
 }
 
+impl<'a> SendPacket<'a> {
+    #[inline]
+    pub fn serialize(&self, buf: &mut [u8]) -> usize {
+        Packet::Send(*self).serialize(buf)
+    }
+}
+
+impl RecvPacket {
+    #[inline]
+    pub fn serialize(self, buf: &mut [u8]) -> usize {
+        Packet::Recv(self).serialize(buf)
+    }
+}
+
+impl ConnPacket {
+    #[inline]
+    pub fn serialize(self, buf: &mut [u8]) -> usize {
+        Packet::Conn(self).serialize(buf)
+    }
+}
+
 impl<'a> Packet<'a> {
     /// Parses 28 bytes u32 like that
     ///
@@ -106,9 +146,9 @@ impl<'a> Packet<'a> {
     /// |0000ssssssssssss|
     /// |ssssssssssssssss|
     ///
-    //  TODO: Maybe little endian is better
     #[inline]
     fn decode_sequence(bytes: &[u8]) -> SeqNum {
+        assert!(bytes.len() == 4, "Sequece number could be decoded only from 4 bytes");
         let bytes = [bytes[0], bytes[1], bytes[2], bytes[3]];
         let mask = (DISCRIMINANT_MASK as u32) << 24;
         SeqNum(u32::from_be_bytes(bytes) & !mask)
@@ -128,25 +168,30 @@ impl<'a> Packet<'a> {
                 let first = bytes[0] & !DISCRIMINANT_MASK;
                 let payload_size = ((first as u16) << 7) | ((bytes[1] as u16) >> 1);
                 let transfer_size = u32::from_le_bytes([bytes[2], bytes[3], bytes[4], bytes[5]]);
-                Self::Init {
+                Self::Send(SendPacket::Init {
                     payload: payload_size,
                     transfer: transfer_size,
                     name: string_from_null_terminated(&bytes[6..28]).ok()?,
-                }
+                })
             }
-            PacketType::Data => Self::Data {
+            PacketType::Data => Self::Send(SendPacket::Data {
                 seq_num: Self::decode_sequence(&bytes[0..4]),
                 data: &bytes[4..],
-            },
-            PacketType::Ack => Self::Ack(Self::decode_sequence(&bytes[0..4])),
-            PacketType::Nak => Self::Nak(Self::decode_sequence(&bytes[0..4])),
-            PacketType::KeepAlive => Self::KeepAlive,
-            PacketType::InitOk => Self::InitOk,
-            PacketType::KeepAliveOk => Self::KeepAliveOk,
-            PacketType::Syn => Self::Syn,
-            PacketType::SynAck => Self::SynAck(Self::decode_sequence(&bytes[0..4])),
-            PacketType::Fin => Self::Fin,
-            PacketType::FinOk => Self::FinOk,
+            }),
+            PacketType::Ack => Self::Recv(RecvPacket::DataAck(Self::decode_sequence(&bytes[0..4]))),
+            PacketType::Nak => Self::Recv(RecvPacket::Nak(Self::decode_sequence(&bytes[0..4]))),
+            PacketType::KeepAlive => Self::Conn(ConnPacket::KeepAlive),
+            PacketType::InitOk => Self::Recv(RecvPacket::InitOk),
+            PacketType::KeepAliveOk => Self::Conn(ConnPacket::KeepAliveOk),
+            PacketType::Syn => Self::Conn(ConnPacket::Syn),
+            PacketType::SynAck => {
+                Self::Conn(ConnPacket::SynAck(Self::decode_sequence(&bytes[0..4])))
+            }
+            PacketType::SynAckAck => {
+                Self::Conn(ConnPacket::SynAckAck(Self::decode_sequence(&bytes[0..4])))
+            }
+            PacketType::Fin => Self::Send(SendPacket::Fin),
+            PacketType::FinOk => Self::Recv(RecvPacket::FinOk),
         };
         Some(packet)
     }
@@ -154,40 +199,33 @@ impl<'a> Packet<'a> {
     #[inline]
     pub fn serialize(&self, buf: &mut [u8]) -> usize {
         match self {
-            Self::Init {
+            Self::Send(SendPacket::Init {
                 payload: payload_size,
                 transfer: _,
                 name,
-            } => {
+            }) => {
                 let ps = payload_size & 0b1111_1000_0000_0000 == 0;
                 let len = name.map(|n| n.bytes().len()).unwrap_or(0) <= 22;
                 debug_assert!(ps, "Payload size should have 5 high bits zero");
                 debug_assert!(len, "Name should not be greater then 22 bytes");
             }
-            Self::Data { seq_num, data: _ }
-            | Self::Ack(seq_num)
-            | Self::Nak(seq_num)
-            | Self::SynAck(seq_num) => {
+            Self::Send(SendPacket::Data { seq_num, data: _ })
+            | Self::Recv(RecvPacket::DataAck(seq_num) | RecvPacket::Nak(seq_num))
+            | Self::Conn(ConnPacket::SynAckAck(seq_num) | ConnPacket::SynAck(seq_num)) => {
                 let seq = seq_num.0 & 0xF0_00_00_00 == 0;
                 debug_assert!(seq, "Seq num should have 4 high bits zero");
             }
 
-            Self::Fin
-            | Self::FinOk
-            | Self::Syn
-            | Self::KeepAlive
-            | Self::InitOk
-            | Self::KeepAliveOk => {}
+            Self::Send(SendPacket::Fin) | Self::Conn(_) | Self::Recv(_) => {}
         }
-
         let result_len;
 
         match *self {
-            Self::Init {
+            Self::Send(SendPacket::Init {
                 payload: payload_size,
                 transfer: transfer_size,
                 name,
-            } => {
+            }) => {
                 let payload_size = payload_size;
                 buf[0] = (payload_size >> 7) as u8;
                 buf[1] = ((payload_size as u8) & 0b0111_1111) << 1;
@@ -198,35 +236,36 @@ impl<'a> Packet<'a> {
 
                 result_len = 28;
             }
-            Self::Data { seq_num, data } => {
+            Self::Send(SendPacket::Data { seq_num, data }) => {
                 Self::encode_sequence(seq_num, &mut buf[0..4]);
                 buf[4..][..data.len()].copy_from_slice(data);
                 result_len = 4 + data.len();
             }
-            Self::SynAck(seq_num) | Self::Ack(seq_num) | Self::Nak(seq_num) => {
+            Self::Conn(ConnPacket::SynAckAck(seq_num) | ConnPacket::SynAck(seq_num))
+            | Self::Recv(RecvPacket::DataAck(seq_num) | RecvPacket::Nak(seq_num)) => {
                 Self::encode_sequence(seq_num, &mut buf[0..4]);
                 result_len = 4;
             }
-            Self::Fin
-            | Self::FinOk
-            | Self::Syn
-            | Self::KeepAlive
-            | Self::InitOk
-            | Self::KeepAliveOk => result_len = 1,
+            Self::Send(SendPacket::Fin)
+            | Self::Recv(RecvPacket::FinOk | RecvPacket::InitOk)
+            | Self::Conn(ConnPacket::Syn | ConnPacket::KeepAlive | ConnPacket::KeepAliveOk) => {
+                result_len = 1;
+            }
         }
 
         let discriminant = match self {
-            Self::Init { .. } => PacketType::Init,
-            Self::Data { .. } => PacketType::Data,
-            Self::Ack(..) => PacketType::Ack,
-            Self::Nak(..) => PacketType::Nak,
-            Self::KeepAlive => PacketType::KeepAlive,
-            Self::InitOk => PacketType::InitOk,
-            Self::KeepAliveOk => PacketType::KeepAliveOk,
-            Self::Syn => PacketType::Syn,
-            Self::SynAck(..) => PacketType::SynAck,
-            Self::Fin => PacketType::Fin,
-            Self::FinOk => PacketType::FinOk,
+            Self::Send(SendPacket::Init { .. }) => PacketType::Init,
+            Self::Send(SendPacket::Data { .. }) => PacketType::Data,
+            Self::Recv(RecvPacket::DataAck(..)) => PacketType::Ack,
+            Self::Recv(RecvPacket::Nak(..)) => PacketType::Nak,
+            Self::Conn(ConnPacket::KeepAlive) => PacketType::KeepAlive,
+            Self::Recv(RecvPacket::InitOk) => PacketType::InitOk,
+            Self::Conn(ConnPacket::KeepAliveOk) => PacketType::KeepAliveOk,
+            Self::Conn(ConnPacket::Syn) => PacketType::Syn,
+            Self::Conn(ConnPacket::SynAck(..)) => PacketType::SynAck,
+            Self::Conn(ConnPacket::SynAckAck(..)) => PacketType::SynAckAck,
+            Self::Send(SendPacket::Fin) => PacketType::Fin,
+            Self::Recv(RecvPacket::FinOk) => PacketType::FinOk,
         };
 
         buf[0] &= !DISCRIMINANT_MASK;
@@ -237,12 +276,14 @@ impl<'a> Packet<'a> {
     }
 }
 
+#[allow(dead_code)]
 const ASSERT_CONSTANTS: () = assert_constants();
 
 const fn assert_constants() {
-    const DISCRIMINANTS: [PacketType; 11] = [
+    const DISCRIMINANTS: [PacketType; 12] = [
         PacketType::Syn,
         PacketType::SynAck,
+        PacketType::SynAckAck,
         PacketType::Init,
         PacketType::Data,
         PacketType::KeepAlive,
@@ -305,11 +346,11 @@ mod tests {
         ]);
         bytes[6..11].copy_from_slice(b"hello");
         let packet = Packet::deserialize(&bytes).unwrap();
-        if let Packet::Init {
+        if let Packet::Send(SendPacket::Init {
             payload: payload_size,
             transfer: transfer_size,
             name,
-        } = packet
+        }) = packet
         {
             assert_eq!(payload_size, 0b100_0100_0000);
             assert_eq!(name.unwrap(), "hello");
@@ -325,10 +366,10 @@ mod tests {
         bytes[0..4].copy_from_slice(&[0b0001_0000, 0b0000_0000, 0b1000_0000, 0b1111_1111]);
         bytes[4..9].copy_from_slice(b"data!");
         let packet = Packet::deserialize(&bytes).unwrap();
-        if let Packet::Data {
+        if let Packet::Send(SendPacket::Data {
             seq_num: sequence,
             data,
-        } = packet
+        }) = packet
         {
             assert_eq!(sequence.0, 0b0000_1000_0000_1111_1111);
             assert_eq!(data, b"data!");
@@ -339,11 +380,11 @@ mod tests {
 
     #[test]
     fn test_init_packet() {
-        let packet = Packet::Init {
+        let packet = Packet::Send(SendPacket::Init {
             payload: 512,
             transfer: 10000,
             name: Some("testfile"),
-        };
+        });
 
         let mut buf = vec![0; 28];
         packet.serialize(&mut buf);
@@ -357,42 +398,60 @@ mod tests {
         let data = vec![1, 2, 3, 4, 5];
         let mut buf = vec![0; 4 + data.len()];
 
-        let packet = Packet::Data {
+        let packet = SendPacket::Data {
             seq_num: SeqNum(5),
             data: &data,
         };
 
         packet.serialize(&mut buf);
-        let received_packet = Packet::deserialize(&buf).unwrap();
+        let Packet::Send(received_packet) = Packet::deserialize(&buf).unwrap() else {
+            panic!("Unexpected packet type");
+        };
 
         assert_eq!(packet, received_packet);
     }
 
     #[test]
     fn test_ack_packet() {
-        let packet = Packet::Ack(SeqNum(10));
+        let packet = RecvPacket::DataAck(SeqNum(10));
 
         let mut buf = [0; 4];
         packet.serialize(&mut buf);
-        let received_packet = Packet::deserialize(&buf).unwrap();
+        let Packet::Recv(received_packet) = Packet::deserialize(&buf).unwrap() else {
+            panic!("Unexpected packet type");
+        };
 
         assert_eq!(packet, received_packet);
     }
 
     #[test]
     fn test_nack_packet() {
-        let packet = Packet::Nak(SeqNum(20));
+        let packet = RecvPacket::Nak(SeqNum(20));
 
         let mut buf = [0; 4];
         packet.serialize(&mut buf);
-        let received_packet = Packet::deserialize(&buf).unwrap();
+        let Packet::Recv(received_packet) = Packet::deserialize(&buf).unwrap() else {
+            panic!("Unexpected packet type");
+        };
+
+        assert_eq!(packet, received_packet);
+    }
+    #[test]
+    fn test_syn_ack_ack_packet() {
+        let packet = ConnPacket::SynAckAck(SeqNum(10));
+
+        let mut buf = [0; 4];
+        packet.serialize(&mut buf);
+        let Packet::Conn(received_packet) = Packet::deserialize(&buf).unwrap() else {
+            panic!("Unexpected packet type");
+        };
 
         assert_eq!(packet, received_packet);
     }
 
     #[test]
     fn test_keep_alive_packet() {
-        let packet = Packet::KeepAlive;
+        let packet = Packet::Conn(ConnPacket::KeepAlive);
 
         let mut buf = [0; 1];
         packet.serialize(&mut buf);
@@ -403,7 +462,7 @@ mod tests {
 
     #[test]
     fn test_init_ok_packet() {
-        let packet = Packet::InitOk;
+        let packet = Packet::Recv(RecvPacket::InitOk);
 
         let mut buf = [0; 1];
         packet.serialize(&mut buf);
@@ -414,7 +473,7 @@ mod tests {
 
     #[test]
     fn test_ka_ok_packet() {
-        let packet = Packet::KeepAliveOk;
+        let packet = Packet::Conn(ConnPacket::KeepAliveOk);
 
         let mut buf = [0; 1];
         packet.serialize(&mut buf);
