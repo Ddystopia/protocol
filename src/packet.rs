@@ -29,7 +29,7 @@ pub enum ConnPacket {
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub enum SendPacket<'a> {
     Init {
-        payload: u16,
+        payload_size: u16,
         transfer: u32,
         name: Option<&'a str>,
     },
@@ -148,7 +148,10 @@ impl<'a> Packet<'a> {
     ///
     #[inline]
     fn decode_sequence(bytes: &[u8]) -> SeqNum {
-        assert!(bytes.len() == 4, "Sequece number could be decoded only from 4 bytes");
+        assert!(
+            bytes.len() == 4,
+            "Sequece number could be decoded only from 4 bytes"
+        );
         let bytes = [bytes[0], bytes[1], bytes[2], bytes[3]];
         let mask = (DISCRIMINANT_MASK as u32) << 24;
         SeqNum(u32::from_be_bytes(bytes) & !mask)
@@ -169,7 +172,7 @@ impl<'a> Packet<'a> {
                 let payload_size = ((first as u16) << 7) | ((bytes[1] as u16) >> 1);
                 let transfer_size = u32::from_le_bytes([bytes[2], bytes[3], bytes[4], bytes[5]]);
                 Self::Send(SendPacket::Init {
-                    payload: payload_size,
+                    payload_size,
                     transfer: transfer_size,
                     name: string_from_null_terminated(&bytes[6..28]).ok()?,
                 })
@@ -178,7 +181,9 @@ impl<'a> Packet<'a> {
                 seq_num: Self::decode_sequence(&bytes[0..4]),
                 data: &bytes[4..],
             }),
-            PacketType::DataOk => Self::Recv(RecvPacket::DataAck(Self::decode_sequence(&bytes[0..4]))),
+            PacketType::DataOk => {
+                Self::Recv(RecvPacket::DataAck(Self::decode_sequence(&bytes[0..4])))
+            }
             PacketType::Nak => Self::Recv(RecvPacket::Nak(Self::decode_sequence(&bytes[0..4]))),
             PacketType::KeepAlive => Self::Conn(ConnPacket::KeepAlive),
             PacketType::InitOk => Self::Recv(RecvPacket::InitOk),
@@ -200,7 +205,7 @@ impl<'a> Packet<'a> {
     pub fn serialize(&self, buf: &mut [u8]) -> usize {
         match self {
             Self::Send(SendPacket::Init {
-                payload: payload_size,
+                payload_size,
                 transfer: _,
                 name,
             }) => {
@@ -222,7 +227,7 @@ impl<'a> Packet<'a> {
 
         match *self {
             Self::Send(SendPacket::Init {
-                payload: payload_size,
+                payload_size,
                 transfer: transfer_size,
                 name,
             }) => {
@@ -347,7 +352,7 @@ mod tests {
         bytes[6..11].copy_from_slice(b"hello");
         let packet = Packet::deserialize(&bytes).unwrap();
         if let Packet::Send(SendPacket::Init {
-            payload: payload_size,
+            payload_size,
             transfer: transfer_size,
             name,
         }) = packet
@@ -381,7 +386,7 @@ mod tests {
     #[test]
     fn test_init_packet() {
         let packet = Packet::Send(SendPacket::Init {
-            payload: 512,
+            payload_size: 512,
             transfer: 10000,
             name: Some("testfile"),
         });

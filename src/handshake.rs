@@ -1,12 +1,13 @@
 use std::io::{self, ErrorKind};
 use std::net::SocketAddr;
 
-use tokio::net::{ToSocketAddrs, UdpSocket};
 use tokio::time::{self, Instant};
 
+use crate::UdpSocket;
+use crate::ToSocketAddrs;
 use crate::{
     packet::{ConnPacket, Packet, SeqNum},
-    MTU, TIMEOUT,
+    MSS, TIMEOUT,
 };
 
 mod private {
@@ -23,7 +24,7 @@ pub(crate) async fn handshake_active(
     addr: impl ToSocketAddrs,
 ) -> io::Result<Handshake> {
     socket.connect(addr).await?;
-    let mut buf = [0; MTU];
+    let mut buf = [0; MSS];
 
     let len = ConnPacket::Syn.serialize(&mut buf);
     socket.send(&buf[..len]).await?;
@@ -62,7 +63,7 @@ pub(crate) async fn handshake_active(
 #[inline]
 pub(crate) async fn handshake_passive(socket: &UdpSocket) -> io::Result<Handshake> {
     'from_scratch: loop {
-        let mut buf = [0; MTU];
+        let mut buf = [0; MSS];
         let seq_num = SeqNum(4);
 
         let (seq_num, addr) = 'listening_for_syn: loop {
@@ -141,7 +142,7 @@ pub(crate) async fn handshake_passive_sm(socket: &UdpSocket) -> io::Result<Hands
 
     let mut state = State::Listening;
     let mut at = None;
-    let mut buf = [0; MTU];
+    let mut buf = [0; MSS];
     let seq_num = SeqNum(5);
 
     loop {
@@ -204,7 +205,7 @@ mod test {
     use super::*;
 
     use std::time::Duration;
-    use tokio::net::UdpSocket;
+    use crate::UdpSocket;
 
     #[tokio::test]
     async fn connection_establishment() {

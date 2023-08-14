@@ -8,10 +8,7 @@ use std::{
 
 use rustc_hash::FxHashMap;
 
-use tokio::{
-    net::UdpSocket,
-    sync::{mpsc, Notify},
-};
+use tokio::sync::{mpsc, Notify};
 use tokio_util::time::{delay_queue::Key, DelayQueue};
 
 use crate::{
@@ -23,7 +20,7 @@ use crate::{
         SendPacket::{self, Data, Fin, Init},
     },
     packet::{Packet, SeqNum},
-    Message, MessageKind, MTU, TIMEOUT,
+    Message, MessageData, UdpSocket, MSS, TIMEOUT,
 };
 
 const WINDOW_SIZE: usize = 128;
@@ -77,7 +74,8 @@ enum DelayEvent {
 }
 
 struct SendState {
-    message: Message,
+    transfer: Vec<u8>,
+    payload_size: u16,
     timeout_keys: FxHashMap<SeqNum, Key>,
     fin_timeout_key: Option<Key>,
     next_to_send: SeqNum,
@@ -86,15 +84,15 @@ struct SendState {
 impl SendState {
     #[inline]
     fn seq_num_count(&mut self) -> usize {
-        let payload_size = self.message.payload_size as usize;
-        let transfer = self.message.payload.len();
+        let payload_size = self.payload_size as usize;
+        let transfer = self.transfer.len();
         (transfer + payload_size - 1) / payload_size
     }
 }
 
 struct ReceiveState {
     recv_bytes: Vec<u8>,
-    payload_size: usize,
+    payload_size: u16,
     name: Option<String>,
 }
 
@@ -107,7 +105,7 @@ pub(crate) async fn event_loop(
     mut api_sender_rx: mpsc::Receiver<Message>,
     api_received_messages_tx: mpsc::Sender<Message>,
 ) -> std::io::Result<UdpSocket> {
-    let mut buf = [0; MTU];
+    let mut buf = [0; MSS];
     let mut reader: Option<ReceiveState> = None;
     let mut sender: Option<SendState> = None;
     let mut timers = DelayQueue::new();
@@ -121,12 +119,6 @@ pub(crate) async fn event_loop(
             _ = async { /* would not react immediately */},
                 if shutdown.load(Relaxed) => return Ok(socket),
 
-            Some(expired) = delay_event => match expired.into_inner() {
-                DelayEvent::Ack(s) => Sig::Send(SendSig::AckExpired(s)),
-                DelayEvent::Fin => Sig::Send(SendSig::FinExpired),
-                DelayEvent::KeepAliveExpired => Sig::Conn(ConnSig::KeepAliveExpired),
-            },
-
             socket_res = socket.recv(&mut buf) => match socket_res {
                 Ok(len) => match Packet::deserialize(&buf[..len]) {
                     Some(Packet::Conn(p)) => Sig::Conn(ConnSig::Packet(p)),
@@ -137,11 +129,17 @@ pub(crate) async fn event_loop(
                 Err(e) => Sig::Conn(ConnSig::SocketError(e))
             },
 
+            _ = tokio::time::sleep(TIMEOUT) => Sig::Conn(ConnSig::KeepAlive),
+
+            Some(expired) = delay_event => match expired.into_inner() {
+                DelayEvent::Ack(s) => Sig::Send(SendSig::AckExpired(s)),
+                DelayEvent::Fin => Sig::Send(SendSig::FinExpired),
+                DelayEvent::KeepAliveExpired => Sig::Conn(ConnSig::KeepAliveExpired),
+            },
+
             msg = api_sender_rx.recv() => {
                 Sig::Send(SendSig::StartSendingFile(msg.expect("API sender channel closed")))
-            }
-
-            _ = tokio::time::sleep(TIMEOUT) => Sig::Conn(ConnSig::KeepAlive)
+            },
         };
 
         match sig {
@@ -227,18 +225,22 @@ pub(crate) async fn event_loop(
                 }
 
                 (SendSig::StartSendingFile(message), None) => {
-                    let packet = Init {
-                        payload: message.payload_size,
-                        transfer: message.payload.len() as u32,
-                        name: match &message.kind {
-                            MessageKind::File(name) => Some(name),
-                            MessageKind::Text => None,
-                        },
+                    let (transfer, filename) = match message.data {
+                        MessageData::File { name, payload } => (payload, Some(name)),
+                        MessageData::Text(text) => (text.into_bytes(), None),
                     };
+
+                    let packet = Init {
+                        payload_size: message.payload_size,
+                        transfer: transfer.len() as u32,
+                        name: filename.as_deref(),
+                    };
+
                     let len = packet.serialize(&mut buf);
                     socket.send(&buf[..len]).await?;
                     sender = Some(SendState {
-                        message,
+                        transfer,
+                        payload_size: message.payload_size,
                         timeout_keys: FxHashMap::default(),
                         next_to_send: SeqNum(0),
                         fin_timeout_key: None,
@@ -273,15 +275,15 @@ pub(crate) async fn event_loop(
                 (RecvSig::Packet(Data { seq_num, data }), Some(mut re)) => {
                     // TODO: Nak maybe?
                     debug_assert!(
-                        data.len() <= re.payload_size,
+                        data.len() <= re.payload_size.into(),
                         "Data packet size is bigger then payload_size",
                     );
 
-                    let bytes_before = seq_num.0 as usize * re.payload_size;
+                    let bytes_before = seq_num.0 as usize * re.payload_size as usize;
                     re.recv_bytes[bytes_before..][..data.len()].copy_from_slice(data);
                     reader = Some(re);
 
-                    // A bit slover version
+                    // // A bit slover version
                     // let mut local_buf = [0; 4];
                     // DataAck(seq_num).serialize(&mut local_buf);
                     // socket.send(&local_buf[..4]).await?;
@@ -297,11 +299,15 @@ pub(crate) async fn event_loop(
                     socket.send(&buf[..len]).await?;
 
                     let message = Message {
-                        payload: re.recv_bytes,
-                        payload_size: re.payload_size as u16,
-                        kind: match re.name {
-                            Some(name) => MessageKind::File(name),
-                            None => MessageKind::Text,
+                        payload_size: re.payload_size,
+                        data: match re.name {
+                            Some(name) => MessageData::File {
+                                name,
+                                payload: re.recv_bytes,
+                            },
+                            None => MessageData::Text(
+                                String::from_utf8(re.recv_bytes).expect("Should be valid utf-8"),
+                            ),
                         },
                     };
 
@@ -314,10 +320,10 @@ pub(crate) async fn event_loop(
                 }
 
                 #[rustfmt::skip]
-                (RecvSig::Packet(Init { payload, transfer, name }), re) => 'b: {
+                (RecvSig::Packet(Init { payload_size, transfer, name }), re) => 'b: {
                     if let Some(r) = re {
                         if !(r.recv_bytes.len() == transfer as usize
-                            && r.payload_size == payload as usize
+                            && r.payload_size == payload_size
                             && r.name.as_ref().zip(name).map_or(true, |(a, b)| a == b))
                         {
                             reader = Some(r);
@@ -332,7 +338,7 @@ pub(crate) async fn event_loop(
 
                     reader = Some(ReceiveState {
                         recv_bytes: vec![0; transfer as usize],
-                        payload_size: payload as usize,
+                        payload_size,
                         name,
                     });
                 }
@@ -351,13 +357,12 @@ async fn send_data_packet(
     seq_num: SeqNum,
     timers: &mut DelayQueue<DelayEvent>,
 ) -> std::io::Result<()> {
-    let msg = &sender.message;
-    let payload_size = msg.payload_size as usize;
+    let payload_size = sender.payload_size as usize;
     let bytes_before = seq_num.0 as usize * payload_size;
 
-    debug_assert!(bytes_before < msg.payload.len(), "Too many bytes sent.");
+    debug_assert!(bytes_before < sender.transfer.len(), "Too many bytes sent.");
 
-    let next_bytes = &msg.payload[bytes_before..];
+    let next_bytes = &sender.transfer[bytes_before..];
 
     let len = Data {
         seq_num,

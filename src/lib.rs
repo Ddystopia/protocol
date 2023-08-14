@@ -2,16 +2,21 @@
 
 mod event_loop;
 mod handshake;
+#[cfg(feature = "mock")]
+mod mock;
 mod packet;
 
 use std::{
     io,
-    sync::{atomic::{AtomicBool, Ordering::Relaxed}, Arc},
+    num::TryFromIntError,
+    sync::{
+        atomic::{AtomicBool, Ordering::Relaxed},
+        Arc,
+    },
     time::Duration,
 };
 
 use tokio::{
-    net::{ToSocketAddrs, UdpSocket},
     sync::{
         mpsc::{self, error::SendError},
         Notify,
@@ -21,21 +26,32 @@ use tokio::{
 
 use handshake::Handshake;
 
-pub(crate) const MTU: usize = 1500 - 8;
+const MTU: usize = 1500;
+const MSS: usize = MTU - 8 /* UDP */ - 20 /* IP */;
+pub const MAX_PAYLOAD_SIZE: u16 = MSS as u16 - 4 /* Header for `Data` */;
 
 pub(crate) const TIMEOUT: Duration = Duration::from_millis(50);
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-enum MessageKind {
-    Text,
-    File(String),
-}
+#[cfg(not(feature = "mock"))]
+pub(crate) type UdpSocket = tokio::net::UdpSocket;
+#[cfg(not(feature = "mock"))]
+pub(crate) use tokio::net::ToSocketAddrs;
+
+#[cfg(feature = "mock")]
+pub(crate) type UdpSocket = mock::Mock;
+#[cfg(feature = "mock")]
+pub(crate) use mock::ToSocketAddrs;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Message {
-    kind: MessageKind,
-    payload: Vec<u8>,
+    data: MessageData,
     payload_size: u16,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum MessageData {
+    Text(String),
+    File { name: String, payload: Vec<u8> },
 }
 
 pub struct Server {
@@ -123,24 +139,24 @@ impl Message {
     /// Creates a new message with the provided payload.
     /// # Panics
     /// - If the total transfer size is bigger then 4GiB.
-    /// - If the payload size is bigger then 1488 bytes.
+    /// - If the payload size is bigger then `MAX_PAYLOAD_SIZE` bytes.
     #[must_use]
     pub fn file(payload: Vec<u8>, payload_size: u16, filename: String) -> Self {
-        assert!(u32::try_from(payload.len()).is_ok(), "Payload too big");
-        assert!(payload_size <= MTU as u16 - 4, "Payload too big");
+        assert!(u32::try_from(payload.len()).is_ok(), "Payload is too big");
+        assert!(payload_size <= MAX_PAYLOAD_SIZE, "Payload is too big");
         Self {
-            kind: MessageKind::File(filename),
-            payload,
+            data: MessageData::File {
+                name: filename,
+                payload,
+            },
             payload_size,
         }
     }
-    #[must_use]
-    pub fn text(payload: Vec<u8>, payload_size: u16) -> Self {
-        Self {
-            kind: MessageKind::Text,
-            payload,
-            payload_size,
-        }
+    pub fn text(payload: String) -> Result<Self, TryFromIntError> {
+        Ok(Self {
+            payload_size: u16::try_from(payload.len())?,
+            data: MessageData::Text(payload),
+        })
     }
 }
 
@@ -177,22 +193,57 @@ impl Drop for Connection {
 }
 
 #[cfg(test)]
-mod test {
-    use tokio::time::Instant;
-
+pub(crate) mod test {
+    #![allow(clippy::type_complexity)]
     use super::*;
+    use tokio::time::Instant;
 
     #[tokio::test]
     async fn hello_world() {
         const ADDR1: &str = "127.0.0.1:10201";
         const ADDR2: &str = "127.0.0.1:10202";
 
+        let message = "Hello, world!";
+        let msg = Message::text(message.to_string()).unwrap();
+
+        let h1 = tokio::spawn(async move {
+            let server = Server::bind(ADDR1).await.unwrap();
+            let mut connection = server.connect(ADDR2).await.unwrap();
+            let (mut tx, _) = connection.split();
+            tx.send(msg).await
+        });
+        let h2 = tokio::spawn(async move {
+            let server = Server::bind(ADDR2).await.unwrap();
+            let mut connection = server.listen().await.unwrap();
+            let (_, mut rx) = connection.split();
+            rx.recv().await
+        });
+
+        let (r1, r2) = tokio::join!(h1, h2);
+        r1.unwrap().unwrap();
+        let transfered_message = r2.unwrap().unwrap();
+        match &transfered_message.data {
+            MessageData::File { .. } => {
+                assert!(matches!(transfered_message.data, MessageData::Text(_)));
+            }
+            MessageData::Text(text) => {
+                println!("Message: {message}");
+                assert!(text == message);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn random_data() {
+        const ADDR1: &str = "127.0.0.1:10203";
+        const ADDR2: &str = "127.0.0.1:10204";
+
         let size = 40 * 2usize.pow(20);
         let mut data = vec![0; size];
         for (i, x) in data.iter_mut().enumerate() {
             *x = (i % 256) as u8;
         }
-        let msg = Message::file(data, 1460, "Ivakura.txt".to_string());
+        let msg = Message::file(data, MSS as u16, "Ivakura.txt".to_string());
         let msg_clone = msg.clone();
         let start = Instant::now();
 
@@ -215,8 +266,10 @@ mod test {
         let transfered_message = r2.unwrap().unwrap();
         assert_eq!(transfered_message, msg);
         println!(
-            "Speed: {}Mib/sec",
-            (size / 1000 * 8) / duration.as_millis() as usize
+            "Speed: {} Mib/sec",
+            (size / 1000 * 8)
+                .checked_div(duration.as_millis().try_into().unwrap())
+                .unwrap_or(0)
         );
     }
 }

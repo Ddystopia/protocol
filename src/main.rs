@@ -1,6 +1,6 @@
 use tokio::time::Instant;
 
-use protocol::{Message, Server};
+use protocol::{Message, Server, MAX_PAYLOAD_SIZE};
 
 #[tokio::main]
 async fn main() {
@@ -8,7 +8,7 @@ async fn main() {
     const ADDR2: &str = "127.0.0.1:6202";
 
     let size = 4000 * 2usize.pow(20);
-    let msg = Message::file(vec![5u8; size], 1488, "Ivakura.txt".to_string());
+    let msg = Message::file(vec![5u8; size], MAX_PAYLOAD_SIZE, "Ivakura.txt".to_string());
     let msg_clone = msg.clone();
     let start = Instant::now();
 
