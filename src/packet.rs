@@ -1,4 +1,4 @@
-use std::{ops::AddAssign, str::Utf8Error};
+use std::{ops::AddAssign, str::Utf8Error, fmt::{Formatter, Debug}};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct SeqNum(pub u32);
@@ -26,7 +26,7 @@ pub enum ConnPacket {
 }
 
 /// Packet that Sender sends to Receiver
-#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+#[derive(Copy, Clone, PartialEq, Eq)]
 pub enum SendPacket<'a> {
     Init {
         payload_size: u16,
@@ -38,6 +38,31 @@ pub enum SendPacket<'a> {
         data: &'a [u8],
     },
     Fin,
+    FinOkOk,
+}
+
+impl Debug for SendPacket<'_> {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SendPacket::Init {
+                payload_size,
+                transfer,
+                name,
+            } => f
+                .debug_struct("SendPacket::Init")
+                .field("payload_size", payload_size)
+                .field("transfer", transfer)
+                .field("name", name)
+                .finish(),
+            SendPacket::Data { seq_num, data } => f
+                .debug_struct("SendPacket::Data")
+                .field("seq_num", seq_num)
+                .field("data.len", &data.len())
+                .finish(),
+            SendPacket::Fin => f.debug_struct("SendPacket::Fin").finish(),
+            SendPacket::FinOkOk => f.debug_struct("SendPacket::FinOkOk").finish(),
+        }
+    }
 }
 
 /// Packet that Receiver sends to Sender
@@ -50,24 +75,38 @@ pub enum RecvPacket {
 }
 
 const DISCRIMINANT_MASK: u8 = 0xF0;
+const SYN: u8 = 0b0111 << 4;
+const SYN_ACK: u8 = 0b1000 << 4;
+const SYN_ACK_ACK: u8 = 0b1011 << 4;
+const INIT: u8 = 0b0000 << 4;
+const DATA: u8 = 0b0001 << 4;
+const DATA_OK: u8 = 0b0101 << 4;
+const NAK: u8 = 0b0110 << 4;
+const KEEPALIVE: u8 = 0b0010 << 4;
+const INIT_OK: u8 = 0b0011 << 4;
+const KEEPALIVE_OK: u8 = 0b100 << 4;
+const FIN: u8 = 0b1001 << 4;
+const FIN_OK: u8 = 0b1010 << 4;
+const FIN_OK_OK: u8 = 0b1100 << 4;
 
 // IMPORTANT: When adding new packet types, update `assert_constant`
 //            function to include new one
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(crate) enum PacketType {
-    Syn = 0b0111 << 4,
-    SynAck = 0b1000 << 4,
-    SynAckAck = 0b1011 << 4,
-    Init = 0b0000 << 4,
-    Data = 0b0001 << 4,
-    DataOk = 0b0101 << 4,
-    Nak = 0b0110 << 4,
-    KeepAlive = 0b0010 << 4,
-    InitOk = 0b0011 << 4,
-    KeepAliveOk = 0b100 << 4,
-    Fin = 0b1001 << 4,
-    FinOk = 0b1010 << 4,
+    Syn = SYN,
+    SynAck = SYN_ACK,
+    SynAckAck = SYN_ACK_ACK,
+    Init = INIT,
+    Data = DATA,
+    DataOk = DATA_OK,
+    Nak = NAK,
+    KeepAlive = KEEPALIVE,
+    InitOk = INIT_OK,
+    KeepAliveOk = KEEPALIVE_OK,
+    Fin = FIN,
+    FinOk = FIN_OK,
+    FinOkOk = FIN_OK_OK
 }
 
 impl TryFrom<u8> for PacketType {
@@ -83,25 +122,26 @@ const fn try_from(value: u8) -> Result<PacketType, ()> {
     if value & !DISCRIMINANT_MASK != 0 {
         return Err(());
     }
-    let result = match value >> 4 {
-        0b0111 => Ok(PacketType::Syn),
-        0b1000 => Ok(PacketType::SynAck),
-        0b1011 => Ok(PacketType::SynAckAck),
-        0b0000 => Ok(PacketType::Init),
-        0b0001 => Ok(PacketType::Data),
-        0b0101 => Ok(PacketType::DataOk),
-        0b0110 => Ok(PacketType::Nak),
-        0b0010 => Ok(PacketType::KeepAlive),
-        0b0011 => Ok(PacketType::InitOk),
-        0b0100 => Ok(PacketType::KeepAliveOk),
-        0b1001 => Ok(PacketType::Fin),
-        0b1010 => Ok(PacketType::FinOk),
+    let result = match value {
+        SYN => Ok(PacketType::Syn),
+        SYN_ACK => Ok(PacketType::SynAck),
+        SYN_ACK_ACK => Ok(PacketType::SynAckAck),
+        INIT => Ok(PacketType::Init),
+        DATA => Ok(PacketType::Data),
+        DATA_OK => Ok(PacketType::DataOk),
+        NAK => Ok(PacketType::Nak),
+        KEEPALIVE => Ok(PacketType::KeepAlive),
+        INIT_OK => Ok(PacketType::InitOk),
+        KEEPALIVE_OK => Ok(PacketType::KeepAliveOk),
+        FIN => Ok(PacketType::Fin),
+        FIN_OK => Ok(PacketType::FinOk),
+        FIN_OK_OK => Ok(PacketType::FinOkOk),
         _ => Err(()),
     };
     assert!(
         match result {
             Ok(x) => x as u8 == value,
-            Err(_) => true,
+            Err(()) => true,
         },
         "Conversion of Packet type is wrong"
     );
@@ -197,6 +237,7 @@ impl<'a> Packet<'a> {
             }
             PacketType::Fin => Self::Send(SendPacket::Fin),
             PacketType::FinOk => Self::Recv(RecvPacket::FinOk),
+            PacketType::FinOkOk => Self::Send(SendPacket::FinOkOk),
         };
         Some(packet)
     }
@@ -221,17 +262,15 @@ impl<'a> Packet<'a> {
                 debug_assert!(seq, "Seq num should have 4 high bits zero");
             }
 
-            Self::Send(SendPacket::Fin) | Self::Conn(_) | Self::Recv(_) => {}
+            Self::Send(SendPacket::Fin | SendPacket::FinOkOk) | Self::Conn(_) | Self::Recv(_) => {}
         }
-        let result_len;
 
-        match *self {
+        let result_len = match *self {
             Self::Send(SendPacket::Init {
                 payload_size,
                 transfer: transfer_size,
                 name,
             }) => {
-                let payload_size = payload_size;
                 buf[0] = (payload_size >> 7) as u8;
                 buf[1] = ((payload_size as u8) & 0b0111_1111) << 1;
                 buf[2..6].copy_from_slice(&transfer_size.to_le_bytes());
@@ -239,24 +278,22 @@ impl<'a> Packet<'a> {
                     buf[6..][..name.len()].copy_from_slice(name.as_bytes());
                 }
 
-                result_len = 28;
+                28
             }
             Self::Send(SendPacket::Data { seq_num, data }) => {
                 Self::encode_sequence(seq_num, &mut buf[0..4]);
                 buf[4..][..data.len()].copy_from_slice(data);
-                result_len = 4 + data.len();
+                4 + data.len()
             }
             Self::Conn(ConnPacket::SynAckAck(seq_num) | ConnPacket::SynAck(seq_num))
             | Self::Recv(RecvPacket::DataAck(seq_num) | RecvPacket::Nak(seq_num)) => {
                 Self::encode_sequence(seq_num, &mut buf[0..4]);
-                result_len = 4;
+                4
             }
-            Self::Send(SendPacket::Fin)
+            Self::Send(SendPacket::Fin | SendPacket::FinOkOk)
             | Self::Recv(RecvPacket::FinOk | RecvPacket::InitOk)
-            | Self::Conn(ConnPacket::Syn | ConnPacket::KeepAlive | ConnPacket::KeepAliveOk) => {
-                result_len = 1;
-            }
-        }
+            | Self::Conn(ConnPacket::Syn | ConnPacket::KeepAlive | ConnPacket::KeepAliveOk) => 1,
+        };
 
         let discriminant = match self {
             Self::Send(SendPacket::Init { .. }) => PacketType::Init,
@@ -271,6 +308,7 @@ impl<'a> Packet<'a> {
             Self::Conn(ConnPacket::SynAckAck(..)) => PacketType::SynAckAck,
             Self::Send(SendPacket::Fin) => PacketType::Fin,
             Self::Recv(RecvPacket::FinOk) => PacketType::FinOk,
+            Self::Send(SendPacket::FinOkOk) => PacketType::FinOkOk,
         };
 
         buf[0] &= !DISCRIMINANT_MASK;
@@ -285,7 +323,7 @@ impl<'a> Packet<'a> {
 const ASSERT_CONSTANTS: () = assert_constants();
 
 const fn assert_constants() {
-    const DISCRIMINANTS: [PacketType; 12] = [
+    const DISCRIMINANTS: [PacketType; 13] = [
         PacketType::Syn,
         PacketType::SynAck,
         PacketType::SynAckAck,
@@ -298,6 +336,7 @@ const fn assert_constants() {
         PacketType::Nak,
         PacketType::Fin,
         PacketType::FinOk,
+        PacketType::FinOkOk,
     ];
     const LEN: usize = DISCRIMINANTS.len();
     let mut i = 0;
@@ -306,7 +345,7 @@ const fn assert_constants() {
         assert!(
             match try_from(DISCRIMINANTS[i] as u8) {
                 Ok(d) => d as u8 == DISCRIMINANTS[i] as u8,
-                Err(_) => false,
+                Err(()) => panic!("Caramba!"),
             },
             "Try from should work fine."
         );

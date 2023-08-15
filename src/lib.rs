@@ -1,12 +1,16 @@
 #![allow(clippy::missing_errors_doc)]
+// TODO: rename `FIN` to something else
+//       it is not closing connection, it ends the transfer
+//       maybe `END` or `EOF`?
 
 mod event_loop;
 mod handshake;
 #[cfg(feature = "mock")]
-mod mock;
+pub mod mock;
 mod packet;
 
 use std::{
+    fmt::Debug,
     io,
     num::TryFromIntError,
     sync::{
@@ -28,19 +32,27 @@ use handshake::Handshake;
 
 const MTU: usize = 1500;
 const MSS: usize = MTU - 8 /* UDP */ - 20 /* IP */;
-pub const MAX_PAYLOAD_SIZE: u16 = MSS as u16 - 4 /* Header for `Data` */;
+pub const MAX_TRANSFER_SIZE: u16 = MSS as u16 - 4 /* Header for `Data` */;
 
-pub(crate) const TIMEOUT: Duration = Duration::from_millis(50);
+pub(crate) const ACK_TIMEOUT: Duration = Duration::from_millis(10);
+pub(crate) const KA_TIMEOUT: Duration = Duration::from_secs(2);
 
-#[cfg(not(feature = "mock"))]
-pub(crate) type UdpSocket = tokio::net::UdpSocket;
-#[cfg(not(feature = "mock"))]
-pub(crate) use tokio::net::ToSocketAddrs;
+#[cfg(feature = "mock")]
+use std::sync::atomic::AtomicU32;
+#[cfg(feature = "mock")]
+pub(crate) static NUM_LOSS: AtomicU32 = AtomicU32::new(0);
+#[cfg(feature = "mock")]
+pub(crate) static DEN_LOSS: AtomicU32 = AtomicU32::new(1);
 
 #[cfg(feature = "mock")]
 pub(crate) type UdpSocket = mock::Mock;
 #[cfg(feature = "mock")]
 pub(crate) use mock::ToSocketAddrs;
+
+#[cfg(not(feature = "mock"))]
+pub(crate) type UdpSocket = tokio::net::UdpSocket;
+#[cfg(not(feature = "mock"))]
+pub(crate) use tokio::net::ToSocketAddrs;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Message {
@@ -48,10 +60,23 @@ pub struct Message {
     payload_size: u16,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Clone, PartialEq, Eq, Hash)]
 pub enum MessageData {
     Text(String),
     File { name: String, payload: Vec<u8> },
+}
+
+impl Debug for MessageData {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Text(s) => s.fmt(f),
+            Self::File { name, payload } => f
+                .debug_struct("MessageData::File")
+                .field("name", name)
+                .field("payload (first 20)", &&payload[..20])
+                .finish(),
+        }
+    }
 }
 
 pub struct Server {
@@ -85,7 +110,7 @@ impl Server {
         Ok(Self { socket })
     }
 
-    pub async fn connect(self, addr: impl ToSocketAddrs) -> io::Result<Connection> {
+    pub async fn connect(self, addr: impl ToSocketAddrs + Copy) -> io::Result<Connection> {
         let handshake = handshake::handshake_active(&self.socket, addr).await?;
         Ok(self.create_connection(handshake))
     }
@@ -143,7 +168,7 @@ impl Message {
     #[must_use]
     pub fn file(payload: Vec<u8>, payload_size: u16, filename: String) -> Self {
         assert!(u32::try_from(payload.len()).is_ok(), "Payload is too big");
-        assert!(payload_size <= MAX_PAYLOAD_SIZE, "Payload is too big");
+        assert!(payload_size <= MAX_TRANSFER_SIZE, "Payload is too big");
         Self {
             data: MessageData::File {
                 name: filename,
@@ -178,7 +203,7 @@ impl Connection {
         let socket = tokio::join!(self.event_loop.take().unwrap())
             .0
             .map_err(|_| ())?
-            .map_err(|_| ())?;
+            .unwrap();
         Ok(Server { socket })
     }
 }
@@ -243,7 +268,7 @@ pub(crate) mod test {
         for (i, x) in data.iter_mut().enumerate() {
             *x = (i % 256) as u8;
         }
-        let msg = Message::file(data, MSS as u16, "Ivakura.txt".to_string());
+        let msg = Message::file(data, MAX_TRANSFER_SIZE, "Ivakura.txt".to_string());
         let msg_clone = msg.clone();
         let start = Instant::now();
 

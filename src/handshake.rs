@@ -7,7 +7,7 @@ use crate::UdpSocket;
 use crate::ToSocketAddrs;
 use crate::{
     packet::{ConnPacket, Packet, SeqNum},
-    MSS, TIMEOUT,
+    MSS, ACK_TIMEOUT,
 };
 
 mod private {
@@ -29,7 +29,7 @@ pub(crate) async fn handshake_active(
     let len = ConnPacket::Syn.serialize(&mut buf);
     socket.send(&buf[..len]).await?;
 
-    let mut timeout = Instant::now() + TIMEOUT;
+    let mut timeout = Instant::now() + ACK_TIMEOUT;
 
     let seq_num = 'awaiting_for_syn_ack: loop {
         let timeout_result = time::timeout_at(timeout, socket.recv(&mut buf)).await;
@@ -47,7 +47,7 @@ pub(crate) async fn handshake_active(
                 let len = ConnPacket::Syn.serialize(&mut buf);
                 socket.send(&buf[..len]).await?;
 
-                timeout = Instant::now() + TIMEOUT;
+                timeout = Instant::now() + ACK_TIMEOUT;
             }
         }
     };
@@ -82,7 +82,7 @@ pub(crate) async fn handshake_passive(socket: &UdpSocket) -> io::Result<Handshak
             }
         };
 
-        let mut timeout = Instant::now() + TIMEOUT;
+        let mut timeout = Instant::now() + ACK_TIMEOUT;
 
         'awaiting_for_ack: loop {
             let timeout_resut = time::timeout_at(timeout, socket.recv_from(&mut buf)).await;
@@ -104,6 +104,7 @@ pub(crate) async fn handshake_passive(socket: &UdpSocket) -> io::Result<Handshak
                 },
                 Ok(Err(e)) => match e.kind() {
                     ErrorKind::ConnectionReset | ErrorKind::ConnectionAborted => {
+                        println!("E: {}", e.kind());
                         continue 'from_scratch
                     }
                     ErrorKind::ConnectionRefused => todo!("Idk why but it happens"),
@@ -111,8 +112,8 @@ pub(crate) async fn handshake_passive(socket: &UdpSocket) -> io::Result<Handshak
                 },
                 Err(_elapsed) => {
                     let len = ConnPacket::SynAck(seq_num).serialize(&mut buf);
-                    socket.send(&buf[..len]).await?;
-                    timeout = Instant::now() + TIMEOUT;
+                    socket.send_to(&buf[..len], addr).await?;
+                    timeout = Instant::now() + ACK_TIMEOUT;
                 }
             }
         }
@@ -175,7 +176,7 @@ pub(crate) async fn handshake_passive_sm(socket: &UdpSocket) -> io::Result<Hands
             (State::GotSynSentSynAckWaitingForAck(_, addr @ a), Sig::Timeout) => if addr == a {
                 let len = ConnPacket::SynAck(seq_num).serialize(&mut buf);
                 socket.send_to(&buf[..len], addr).await?;
-                at = Some(Instant::now() + TIMEOUT);
+                at = Some(Instant::now() + ACK_TIMEOUT);
                 state = State::GotSynSentSynAckWaitingForAck(seq_num, addr);
             },
 
@@ -209,8 +210,8 @@ mod test {
 
     #[tokio::test]
     async fn connection_establishment() {
-        const ADDR1: &str = "127.0.0.1:10101";
-        const ADDR2: &str = "127.0.0.1:10102";
+        const ADDR1: &str = "127.0.0.1:10201";
+        const ADDR2: &str = "127.0.0.1:10202";
 
         let socket1 = UdpSocket::bind(ADDR1).await.unwrap();
         let socket2 = UdpSocket::bind(ADDR2).await.unwrap();
@@ -219,7 +220,7 @@ mod test {
 
         let hs1 = tokio::spawn(async move {
             delay_for_active.await;
-            handshake_active(&socket1, ADDR2.clone()).await
+            handshake_active(&socket1, ADDR2).await
         });
 
         let hs2 = tokio::spawn(async move { handshake_passive(&socket2).await });
@@ -232,15 +233,15 @@ mod test {
 
     #[tokio::test]
     async fn racy() {
-        const ADDR1: &str = "127.0.0.1:10105";
-        const ADDR2: &str = "127.0.0.1:10106";
+        const ADDR1: &str = "127.0.0.1:10203";
+        const ADDR2: &str = "127.0.0.1:10204";
 
         let socket1 = UdpSocket::bind(ADDR1).await.unwrap();
         let socket2 = UdpSocket::bind(ADDR2).await.unwrap();
 
         let hs1 = tokio::spawn(async move { handshake_active(&socket1, ADDR2).await });
-        // let hs2 = tokio::spawn(async move { handshake_passive(&socket2).await });
-        let hs2 = tokio::spawn(async move { handshake_passive_sm(&socket2).await });
+        let hs2 = tokio::spawn(async move { handshake_passive(&socket2).await });
+        // let hs2 = tokio::spawn(async move { handshake_passive_sm(&socket2).await });
 
         let (r1, r2) = tokio::join!(hs1, hs2);
         r1.unwrap().unwrap();
