@@ -1,16 +1,10 @@
-use std::{
-    io::ErrorKind,
-    sync::{
-        atomic::{AtomicBool, Ordering::Relaxed},
-        Arc,
-    },
-};
+use std::{io, sync::Arc};
 
 use futures::future::pending;
 use rustc_hash::FxHashMap;
 
 use tokio::{
-    sync::{mpsc, Notify},
+    sync::{mpsc, oneshot, Notify},
     time::{timeout_at, Instant},
 };
 use tokio_util::time::{delay_queue::Key, DelayQueue};
@@ -26,7 +20,7 @@ use crate::{
         SendPacket::{self, Data, Fin, FinOkOk, Init},
     },
     packet::{Packet, SeqNum},
-    Message, MessageData, UdpSocket, ACK_TIMEOUT, KA_TIMEOUT, MSS,
+    Message, MessageData, ShutdownSignalZST, UdpSocket, ACK_TIMEOUT, KA_TIMEOUT, MSS,
 };
 
 const WINDOW_SIZE: usize = 128;
@@ -104,7 +98,7 @@ struct ReceiveState {
 pub(crate) async fn event_loop(
     socket: UdpSocket,
     handshake: Handshake,
-    shutdown: Arc<AtomicBool>,
+    shutdown: oneshot::Receiver<ShutdownSignalZST>,
     api_sender_notify_tx: Arc<Notify>,
     api_sender_rx: mpsc::Receiver<Message>,
     api_received_messages_tx: mpsc::Sender<Message>,
@@ -124,7 +118,7 @@ pub(crate) async fn event_loop(
 pub(crate) async fn _event_loop(
     socket: UdpSocket,
     _handshake: Handshake,
-    shutdown: Arc<AtomicBool>,
+    mut shutdown: oneshot::Receiver<ShutdownSignalZST>,
     api_sender_notify_tx: Arc<Notify>,
     mut api_sender_rx: mpsc::Receiver<Message>,
     api_received_messages_tx: mpsc::Sender<Message>,
@@ -143,11 +137,10 @@ pub(crate) async fn _event_loop(
         let sig = tokio::select! {
             biased;
 
-            () = async {
-                /* would not react immediately */
-                println!("Shutting down...");
-            }, if shutdown.load(Relaxed) => return Ok(socket),
-
+            sh_res = &mut shutdown => return match sh_res {
+                Ok(ShutdownSignalZST) => Ok(socket),
+                Err(_recv_error) => io::Result::Err(io::Error::new(io::ErrorKind::Other, "Error while transmitting Shutdown Signal")),
+            },
             socket_res = socket.recv(&mut buf) => {
                 next_keep_alive = Instant::now() + KA_TIMEOUT;
                 match socket_res {
@@ -219,18 +212,22 @@ pub(crate) async fn _event_loop(
                 }
 
                 ConnSig::SocketError(e) => match e.kind() {
-                    ErrorKind::ConnectionReset | ErrorKind::ConnectionAborted => {
+                    io::ErrorKind::ConnectionReset | io::ErrorKind::ConnectionAborted => {
                         println!("E: {}", e.kind());
                         return Ok(socket);
                     }
-                    ErrorKind::ConnectionRefused => todo!("Idk why but it happens"),
+                    io::ErrorKind::ConnectionRefused => {
+                        todo!("Idk why but it happens (maybe when active before passive)")
+                    }
                     _ => return Err(e),
                 },
             },
 
             Sig::Send(sig) => match (sig, sender) {
                 (SendSig::Packet(DataAck(seq_num_ack)), Some(mut se)) => 'block: {
-                    se.timeout_keys.remove(&seq_num_ack).map(|k| timers.remove(&k));
+                    se.timeout_keys
+                        .remove(&seq_num_ack)
+                        .map(|k| timers.remove(&k));
 
                     let seq_num = se.next_to_send;
 

@@ -3,11 +3,11 @@ use std::net::SocketAddr;
 
 use tokio::time::{self, Instant};
 
-use crate::UdpSocket;
 use crate::ToSocketAddrs;
+use crate::UdpSocket;
 use crate::{
     packet::{ConnPacket, Packet, SeqNum},
-    MSS, ACK_TIMEOUT,
+    ACK_TIMEOUT, MSS,
 };
 
 mod private {
@@ -105,7 +105,7 @@ pub(crate) async fn handshake_passive(socket: &UdpSocket) -> io::Result<Handshak
                 Ok(Err(e)) => match e.kind() {
                     ErrorKind::ConnectionReset | ErrorKind::ConnectionAborted => {
                         println!("E: {}", e.kind());
-                        continue 'from_scratch
+                        continue 'from_scratch;
                     }
                     ErrorKind::ConnectionRefused => todo!("Idk why but it happens"),
                     _ => return Err(e),
@@ -205,8 +205,8 @@ pub(crate) async fn handshake_passive_sm(socket: &UdpSocket) -> io::Result<Hands
 mod test {
     use super::*;
 
-    use std::time::Duration;
     use crate::UdpSocket;
+    use std::time::Duration;
 
     #[tokio::test]
     async fn connection_establishment() {

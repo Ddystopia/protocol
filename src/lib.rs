@@ -9,21 +9,12 @@ mod handshake;
 pub mod mock;
 mod packet;
 
-use std::{
-    fmt::Debug,
-    io,
-    num::TryFromIntError,
-    sync::{
-        atomic::{AtomicBool, Ordering::Relaxed},
-        Arc,
-    },
-    time::Duration,
-};
+use std::{fmt::Debug, io, num::TryFromIntError, sync::Arc, time::Duration};
 
 use tokio::{
     sync::{
         mpsc::{self, error::SendError},
-        Notify,
+        oneshot, Notify,
     },
     task::JoinHandle,
 };
@@ -84,12 +75,17 @@ pub struct Server {
 }
 
 pub struct Connection {
-    event_loop: Option<JoinHandle<io::Result<UdpSocket>>>,
+    event_loop: Option<(
+        JoinHandle<io::Result<UdpSocket>>,
+        oneshot::Sender<ShutdownSignalZST>,
+    )>,
     api_received_messages_rx: mpsc::Receiver<Message>,
     api_sender_tx: mpsc::Sender<Message>,
     api_sender_notify_rx: Arc<Notify>,
-    shutdown_tx: Arc<AtomicBool>,
 }
+
+#[derive(Debug)]
+pub(crate) struct ShutdownSignalZST;
 
 pub struct Receiver<'a>(&'a mut mpsc::Receiver<Message>);
 
@@ -123,24 +119,23 @@ impl Server {
     fn create_connection(self, handshake: Handshake) -> Connection {
         let (api_received_messages_tx, api_received_messages_rx) = mpsc::channel(3);
         let (api_sender_tx, api_sender_rx) = mpsc::channel(1);
-        let shutdown_tx = Arc::new(AtomicBool::new(false));
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
         let api_sender_notify_rx = Arc::new(Notify::new());
 
-        let event_loop = Some(tokio::spawn(event_loop::event_loop(
+        let event_loop_handle = tokio::spawn(event_loop::event_loop(
             self.socket,
             handshake,
-            shutdown_tx.clone(),
+            shutdown_rx,
             api_sender_notify_rx.clone(),
             api_sender_rx,
             api_received_messages_tx,
-        )));
+        ));
 
         Connection {
-            event_loop,
+            event_loop: Some((event_loop_handle, shutdown_tx)),
             api_received_messages_rx,
             api_sender_tx,
             api_sender_notify_rx,
-            shutdown_tx,
         }
     }
 }
@@ -199,20 +194,18 @@ impl Connection {
 
     #[allow(clippy::missing_panics_doc)]
     pub async fn disconnect(mut self) -> Result<Server, ()> {
-        self.shutdown_tx.store(true, Relaxed);
-        let socket = tokio::join!(self.event_loop.take().unwrap())
-            .0
-            .map_err(|_| ())?
-            .unwrap();
+        let (event_loop_handle, shutdown_tx) = self.event_loop.take().unwrap();
+        shutdown_tx.send(ShutdownSignalZST).expect("Error while sending shutdown signal");
+        let socket = tokio::join!(event_loop_handle).0.map_err(|_| ())?.unwrap();
         Ok(Server { socket })
     }
 }
 
 impl Drop for Connection {
     fn drop(&mut self) {
-        if let Some(event_loop) = self.event_loop.take() {
-            self.shutdown_tx.store(true, Relaxed);
-            event_loop.abort();
+        if let Some((event_loop_handle, shutdown_tx)) = self.event_loop.take() {
+            shutdown_tx.send(ShutdownSignalZST).expect("Error while sending shutdown signal");
+            event_loop_handle.abort();
         }
     }
 }

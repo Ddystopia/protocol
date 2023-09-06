@@ -1,4 +1,8 @@
-use std::{ops::AddAssign, str::Utf8Error, fmt::{Formatter, Debug}};
+use std::{
+    fmt::{Debug, Formatter},
+    ops::AddAssign,
+    str::Utf8Error,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct SeqNum(pub u32);
@@ -106,7 +110,7 @@ pub(crate) enum PacketType {
     KeepAliveOk = KEEPALIVE_OK,
     Fin = FIN,
     FinOk = FIN_OK,
-    FinOkOk = FIN_OK_OK
+    FinOkOk = FIN_OK_OK,
 }
 
 impl TryFrom<u8> for PacketType {
