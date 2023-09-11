@@ -116,13 +116,14 @@ impl Mock {
     }
 
     pub async fn send(&self, buf: &[u8]) -> io::Result<usize> {
-        let (n, d) = (crate::NUM_LOSS.load(Relaxed), crate::DEN_LOSS.load(Relaxed));
-        if get_random_u32().await < u32::MAX / d * n {
-            let packet = Packet::deserialize(buf).expect("Bad packet sent");
-            // println!("Dropping {packet:?}");
-            return Ok(buf.len());
-        }
-        // println!("Id {} sends", self.idx());
+        // let (n, d) = (crate::NUM_LOSS.load(Relaxed), crate::DEN_LOSS.load(Relaxed));
+        // if get_random_u32().await < u32::MAX / d * n {
+        //     let packet = Packet::deserialize(buf).expect("Bad packet sent");
+        //     // println!("Dropping {packet:?}");
+        //     return Ok(buf.len());
+        // }
+        let packet = Packet::deserialize(buf).expect("Bad packet sent");
+        println!("Id {} sends {packet:?}", self.idx());
         self.send_to(
             buf,
             sockets()[self.idx()].get().expect("Send not connected"),

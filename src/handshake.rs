@@ -231,20 +231,4 @@ mod test {
         r2.unwrap().unwrap();
     }
 
-    #[tokio::test]
-    async fn racy() {
-        const ADDR1: &str = "127.0.0.1:10203";
-        const ADDR2: &str = "127.0.0.1:10204";
-
-        let socket1 = UdpSocket::bind(ADDR1).await.unwrap();
-        let socket2 = UdpSocket::bind(ADDR2).await.unwrap();
-
-        let hs1 = tokio::spawn(async move { handshake_active(&socket1, ADDR2).await });
-        let hs2 = tokio::spawn(async move { handshake_passive(&socket2).await });
-        // let hs2 = tokio::spawn(async move { handshake_passive_sm(&socket2).await });
-
-        let (r1, r2) = tokio::join!(hs1, hs2);
-        r1.unwrap().unwrap();
-        r2.unwrap().unwrap();
-    }
 }

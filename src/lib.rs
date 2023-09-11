@@ -64,7 +64,7 @@ impl Debug for MessageData {
             Self::File { name, payload } => f
                 .debug_struct("MessageData::File")
                 .field("name", name)
-                .field("payload (first 20)", &&payload[..20])
+                .field("payload (first 20)", &&payload[..payload.len().min(20)])
                 .finish(),
         }
     }
@@ -160,10 +160,12 @@ impl Message {
     /// # Panics
     /// - If the total transfer size is bigger then 4GiB.
     /// - If the payload size is bigger then `MAX_PAYLOAD_SIZE` bytes.
+    /// - If the filename is bigger then 22 bytes.
     #[must_use]
     pub fn file(payload: Vec<u8>, payload_size: u16, filename: String) -> Self {
         assert!(u32::try_from(payload.len()).is_ok(), "Payload is too big");
         assert!(payload_size <= MAX_TRANSFER_SIZE, "Payload is too big");
+        assert!(filename.as_bytes().len() <= 22, "Filename is too big");
         Self {
             data: MessageData::File {
                 name: filename,
@@ -214,12 +216,12 @@ impl Drop for Connection {
 pub(crate) mod test {
     #![allow(clippy::type_complexity)]
     use super::*;
-    use tokio::time::Instant;
+    use tokio::time::{self, Instant};
 
     #[tokio::test]
     async fn hello_world() {
-        const ADDR1: &str = "127.0.0.1:10201";
-        const ADDR2: &str = "127.0.0.1:10202";
+        const ADDR1: &str = "127.0.0.1:10205";
+        const ADDR2: &str = "127.0.0.1:10206";
 
         let message = "Hello, world!";
         let msg = Message::text(message.to_string()).unwrap();
@@ -253,8 +255,8 @@ pub(crate) mod test {
 
     #[tokio::test]
     async fn random_data() {
-        const ADDR1: &str = "127.0.0.1:10203";
-        const ADDR2: &str = "127.0.0.1:10204";
+        const ADDR1: &str = "127.0.0.1:10207";
+        const ADDR2: &str = "127.0.0.1:10208";
 
         let size = 40 * 2usize.pow(20);
         let mut data = vec![0; size];
@@ -289,5 +291,72 @@ pub(crate) mod test {
                 .checked_div(duration.as_millis().try_into().unwrap())
                 .unwrap_or(0)
         );
+    }
+
+    #[tokio::test]
+    async fn keep_alive() {
+        const ADDR1: &str = "127.0.0.1:10209";
+        const ADDR2: &str = "127.0.0.1:10210";
+        const DUR: Duration = Duration::from_secs(10);
+
+        let h1 = tokio::spawn(async move {
+            let server = Server::bind(ADDR1).await.unwrap();
+            let connection = server.connect(ADDR2).await.unwrap();
+            println!("Connected");
+            time::sleep(DUR).await;
+
+            println!("Disconnecting");
+            let r = connection.disconnect().await;
+            println!("Disconnected");
+            r
+        });
+        let h2 = tokio::spawn(async move {
+            let server = Server::bind(ADDR2).await.unwrap();
+            let _connection = server.listen().await.unwrap();
+            time::sleep(DUR).await;
+        });
+
+        let (r1, r2) = tokio::join!(h1, h2);
+        r1.unwrap().expect("Disconnection Failed");
+        r2.unwrap();
+    }
+
+    #[tokio::test]
+    async fn two_messages() {
+        const ADDR1: &str = "127.0.0.1:10213";
+        const ADDR2: &str = "127.0.0.1:10214";
+        const DUR: Duration = Duration::from_millis(2200);
+
+        let message1 = "Hello, world! 1";
+        let message2 = "Hello, world! 2";
+        let msg1 = Message::text(message1.to_string()).unwrap();
+        let msg2 = Message::text(message2.to_string()).unwrap();
+
+        let msg1_c = Message::text(message1.to_string()).unwrap().clone();
+        let msg2_c = Message::text(message2.to_string()).unwrap().clone();
+
+        let h1 = tokio::spawn(async move {
+            let server = Server::bind(ADDR1).await.unwrap();
+            let mut connection = server.connect(ADDR2).await.unwrap();
+            let (mut tx, _) = connection.split();
+            tx.send(msg1).await.expect("Failed to send 1");
+            time::sleep(DUR).await;
+            tx.send(msg2).await.expect("Failed to send 2");
+        });
+        let h2 = tokio::spawn(async move {
+            let server = Server::bind(ADDR2).await.unwrap();
+            let mut connection = server.listen().await.unwrap();
+            let (_, mut rx) = connection.split();
+            let msg1 = rx.recv().await.expect("Failed To Recv 1");
+            let msg2 = rx.recv().await.expect("Failed To Recv 1");
+            (msg1, msg2)
+        });
+
+        let (r1, r2) = tokio::join!(h1, h2);
+        r1.unwrap();
+        let (tm1, tm2) = r2.unwrap();
+        assert!(msg1_c == tm1);
+        dbg!(msg2_c.clone(), tm2.clone());
+        assert!(msg2_c == tm2);
     }
 }

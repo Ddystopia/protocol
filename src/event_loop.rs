@@ -123,8 +123,6 @@ pub(crate) async fn _event_loop(
     mut api_sender_rx: mpsc::Receiver<Message>,
     api_received_messages_tx: mpsc::Sender<Message>,
 ) -> std::io::Result<UdpSocket> {
-    // RESENT.store(0, Relaxed);
-
     let mut buf = [0; MSS];
     let mut reader: Option<ReceiveState> = None;
     let mut sender: Option<SendState> = None;
@@ -139,7 +137,7 @@ pub(crate) async fn _event_loop(
 
             sh_res = &mut shutdown => return match sh_res {
                 Ok(ShutdownSignalZST) => Ok(socket),
-                Err(_recv_error) => io::Result::Err(io::Error::new(io::ErrorKind::Other, "Error while transmitting Shutdown Signal")),
+                Err(_recv_error) => Ok(socket), // Server dropped
             },
             socket_res = socket.recv(&mut buf) => {
                 next_keep_alive = Instant::now() + KA_TIMEOUT;
@@ -184,6 +182,7 @@ pub(crate) async fn _event_loop(
                 }
 
                 ConnSig::Packet(KeepAlive) => {
+                    println!("Got KeepAlive");
                     let len = ConnPacket::KeepAliveOk.serialize(&mut buf);
                     socket.send(&buf[..len]).await?;
                 }
@@ -194,11 +193,7 @@ pub(crate) async fn _event_loop(
                 }
 
                 ConnSig::KeepAlive => {
-                    println!(
-                        "sending keepalive. S:{:?} R:{:?}",
-                        sender.is_some(),
-                        reader.is_some()
-                    );
+                    println!("Sending keepalive",);
                     let len = ConnPacket::KeepAlive.serialize(&mut buf);
                     socket.send(&buf[..len]).await?;
                     let key = timers.insert(Expired::KeepAlive, ACK_TIMEOUT);
@@ -426,6 +421,7 @@ pub(crate) async fn _event_loop(
 
                 #[rustfmt::skip]
                 (RecvSig::Packet(Init { payload_size, transfer, name }), re) => 'b: {
+                    println!("Init packet arrived");
                     if let Some(r) = re {
                         if !(r.recv_bytes.len() == transfer as usize
                             && r.payload_size == payload_size

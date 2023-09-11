@@ -278,8 +278,9 @@ impl<'a> Packet<'a> {
                 buf[0] = (payload_size >> 7) as u8;
                 buf[1] = ((payload_size as u8) & 0b0111_1111) << 1;
                 buf[2..6].copy_from_slice(&transfer_size.to_le_bytes());
-                if let Some(name) = name {
-                    buf[6..][..name.len()].copy_from_slice(name.as_bytes());
+                buf[6..][..22].fill(0);
+                if let Some(name) = name.map(|n| n.as_bytes()) {
+                    buf[6..][..name.len()].copy_from_slice(name);
                 }
 
                 28

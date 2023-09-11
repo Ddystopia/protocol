@@ -1,10 +1,8 @@
-use std::{
-    array::from_fn,
-    net::{IpAddr, Ipv4Addr, SocketAddr},
-    time::Duration,
-};
-
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use tokio::sync::oneshot;
+use std::time::Duration;
+#[cfg(feature = "mock")]
+use std::array::from_fn;
 /*
 
 (loss is should be doubled of what is written)
@@ -20,17 +18,19 @@ Avgs:      4732       4693       4667       4599       2030       1193        81
 Reg :      0.00%      0.82%      1.37%      2.81%     57.10%     74.79%     82.73%
 */
 
+#[cfg(not(feature = "mock"))]
 #[tokio::main]
 async fn main() {
-    #[cfg(not(feature = "mock"))]
-    {
-        let ip = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 0));
-        let speed = test(0, 1, SocketAddr::new(ip, 10200), SocketAddr::new(ip, 10201)).await;
-        println!("Speed: {}Mib/sec", speed);
-        return;
-    }
+    let ip = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 0));
+    let speed = test(0, 1, SocketAddr::new(ip, 10200), SocketAddr::new(ip, 10201)).await;
+    println!("Speed: {}Mib/sec", speed);
+}
+
+#[cfg(feature = "mock")]
+#[tokio::main]
+async fn main() {
     const DEN: u32 = 10000;
-    const TABLE: [u32; 7] = [0, 10, 50, 100, 300, 500, 700];
+    const TABLE: [u32; 5] = [100, 150, 200, 250, 300];
     // const TABLE: [u32; 10] = [0, 10, 50, 100, 300, 500, 700, 1000, 2500, 3500];
     const TRYES: usize = 6;
     let mut results: [[usize; TABLE.len()]; TRYES] = from_fn(|_| from_fn(|_| 0));
@@ -85,12 +85,15 @@ async fn main() {
     println!();
 }
 
+// #[cfg(feature = "mock")]
 async fn test(n: u32, d: u32, a1: SocketAddr, a2: SocketAddr) -> usize {
     use protocol::{Message, Server, MAX_TRANSFER_SIZE};
     use tokio::time::Instant;
 
     #[cfg(feature = "mock")]
     protocol::mock::set_num_den(n, d);
+    #[cfg(not(feature = "mock"))]
+    std::hint::black_box((n, d));
     // return 300;
     let size = 4000 * 2usize.pow(20);
     let msg = Message::file(
