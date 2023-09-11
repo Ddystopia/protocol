@@ -154,7 +154,7 @@ const fn try_from(value: u8) -> Result<PacketType, ()> {
 
 #[inline]
 fn string_from_null_terminated(buf: &[u8]) -> Result<Option<&str>, Utf8Error> {
-    let name_end = buf.iter().take(22).position(|&x| x == 0).unwrap_or(23);
+    let name_end = buf.iter().take(22).position(|&x| x == 0).unwrap_or(22);
     if name_end == 0 {
         return Ok(None);
     }
