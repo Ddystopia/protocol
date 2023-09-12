@@ -392,10 +392,14 @@ pub(crate) async fn _event_loop(
                     reader = Some(re);
                 }
 
-                (RecvSig::Packet(FinOkOk), Some(mut re)) => {
+                (RecvSig::Packet(FinOkOk), Some(mut re)) => 'b: {
                     match re.fin_ok_timeout_key.take() {
                         Some(k) => timers.remove(&k),
-                        None => panic!("FinOkOk arrived before FinOk"),
+                        None => {
+                            // In protocol we ignore weird packets.
+                            reader = Some(re);
+                            break 'b;
+                        }
                     };
 
                     let message = Message {

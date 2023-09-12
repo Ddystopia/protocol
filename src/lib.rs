@@ -180,6 +180,11 @@ impl Message {
             data: MessageData::Text(payload),
         })
     }
+
+    #[must_use]
+    pub fn get_data(&self) -> &MessageData {
+        &self.data
+    }
 }
 
 impl Connection {

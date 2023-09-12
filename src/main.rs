@@ -1,9 +1,14 @@
+use protocol::MessageData;
+
+/*
+#![allow(dead_code)]
+
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-use tokio::sync::oneshot;
+use tokio::{sync::oneshot, net::UdpSocket};
 use std::time::Duration;
 #[cfg(feature = "mock")]
 use std::array::from_fn;
-/*
+
 
 (loss is should be doubled of what is written)
 
@@ -18,11 +23,13 @@ Avgs:      4732       4693       4667       4599       2030       1193        81
 Reg :      0.00%      0.82%      1.37%      2.81%     57.10%     74.79%     82.73%
 */
 
+/*
 #[cfg(not(feature = "mock"))]
 #[tokio::main]
 async fn main() {
     let ip = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 0));
-    let speed = test(0, 1, SocketAddr::new(ip, 10200), SocketAddr::new(ip, 10201)).await;
+    // let speed = test(0, 1, SocketAddr::new(ip, 10200), SocketAddr::new(ip, 10201)).await;
+    let speed = test_udp(SocketAddr::new(ip, 10200), SocketAddr::new(ip, 10201)).await;
     println!("Speed: {}Mib/sec", speed);
 }
 
@@ -136,3 +143,47 @@ async fn test(n: u32, d: u32, a1: SocketAddr, a2: SocketAddr) -> usize {
     assert_eq!(transfered_message, msg, "Message is corrupted");
     (size / 1000 * 8) / duration.as_millis() as usize
 }
+
+
+
+async fn test_udp(a1: SocketAddr, a2: SocketAddr) -> usize {
+    use protocol::{Message, Server, MAX_TRANSFER_SIZE};
+    use tokio::time::Instant;
+
+    let size = 4000 * 2usize.pow(20);
+    let msg = vec![5u8; size];
+    let msg_clone = msg.clone();
+    let (start_tx, start_rx) = oneshot::channel();
+    let (end_tx, mut end_rx) = oneshot::channel();
+
+
+    let h1 = tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        start_tx.send(Instant::now()).unwrap();
+        let socket = UdpSocket::bind(a1).await.expect("Server 1");
+        socket.connect(a2).await.expect("Connect 1");
+        println!("Active Start Sending");
+        for part in msg.chunks(MAX_TRANSFER_SIZE.into()) {
+            socket.send(part).await.expect("Send 1");
+        }
+        println!("Active Sent");
+        end_tx.send(()).unwrap();
+    });
+
+    let h2 = tokio::spawn(async move {
+        let socket = UdpSocket::bind(a2).await.expect("Server 2");
+        while end_rx.try_recv().is_err() {
+            let mut buf = vec![0u8; MAX_TRANSFER_SIZE as usize];
+            let v = socket.recv_from(&mut buf).await.expect("Recv 2");
+            std::hint::black_box(v);
+        }
+        let duration = start_rx.await.unwrap().elapsed();
+        duration
+    });
+
+    let (r1, r2) = tokio::join!(h1, h2);
+    r1.expect("Join");
+    let duration = r2.expect("Join");
+    (size / 1000 * 8) / duration.as_millis() as usize
+}
+*/
