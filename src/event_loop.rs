@@ -227,8 +227,8 @@ pub(crate) async fn _event_loop(
                     let seq_num = se.next_to_send;
 
                     // idk but with switched if it is faster. Maybe just a noise
-                    if seq_num != SeqNum(se.seq_num_count() as u32) {
-                        se.next_to_send += SeqNum(1);
+                    if seq_num != SeqNum::new(se.seq_num_count() as u32) {
+                        se.next_to_send += SeqNum::new(1);
 
                         send_data_packet(&mut se, &socket, &mut buf, seq_num, &mut timers).await?;
 
@@ -310,7 +310,7 @@ pub(crate) async fn _event_loop(
                         filename,
                         payload_size: message.payload_size,
                         timeout_keys: FxHashMap::default(),
-                        next_to_send: SeqNum(0),
+                        next_to_send: SeqNum::new(0),
                         fin_timeout_key: None,
                         time_wait_key: None,
                         init_timeout_key: Some(timers.insert(Expired::Init, ACK_TIMEOUT)),
@@ -337,10 +337,10 @@ pub(crate) async fn _event_loop(
                     se.init_timeout_key.take().map(|k| timers.remove(&k));
                     let send_count = WINDOW_SIZE.min(se.seq_num_count());
                     for left in 0..send_count {
-                        let seq_num = SeqNum(left as u32);
+                        let seq_num = SeqNum::new(left as u32);
                         send_data_packet(&mut se, &socket, &mut buf, seq_num, &mut timers).await?;
                     }
-                    se.next_to_send = SeqNum(send_count as u32);
+                    se.next_to_send = SeqNum::new(send_count as u32);
 
                     sender = Some(se);
                 }
@@ -360,7 +360,7 @@ pub(crate) async fn _event_loop(
                         "Data packet size is bigger then payload_size",
                     );
 
-                    let bytes_before = seq_num.0 as usize * re.payload_size as usize;
+                    let bytes_before = seq_num.get() as usize * re.payload_size as usize;
                     re.recv_bytes[bytes_before..][..data.len()].copy_from_slice(data);
                     reader = Some(re);
 
@@ -464,7 +464,7 @@ async fn send_data_packet(
     timers: &mut DelayQueue<Expired>,
 ) -> std::io::Result<()> {
     let payload_size = sender.payload_size as usize;
-    let bytes_before = seq_num.0 as usize * payload_size;
+    let bytes_before = seq_num.get() as usize * payload_size;
 
     debug_assert!(bytes_before < sender.transfer.len(), "Too many bytes sent.");
 

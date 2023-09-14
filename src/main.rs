@@ -1,7 +1,5 @@
-use protocol::MessageData;
-
-/*
 #![allow(dead_code)]
+#![allow(unused_imports)]
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use tokio::{sync::oneshot, net::UdpSocket};
@@ -10,6 +8,7 @@ use std::time::Duration;
 use std::array::from_fn;
 
 
+/*
 (loss is should be doubled of what is written)
 
 Loss:      0.00%      0.10%      0.50%      1.00%      3.00%      5.00%      7.00%
@@ -23,13 +22,12 @@ Avgs:      4732       4693       4667       4599       2030       1193        81
 Reg :      0.00%      0.82%      1.37%      2.81%     57.10%     74.79%     82.73%
 */
 
-/*
 #[cfg(not(feature = "mock"))]
 #[tokio::main]
 async fn main() {
     let ip = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 0));
-    // let speed = test(0, 1, SocketAddr::new(ip, 10200), SocketAddr::new(ip, 10201)).await;
-    let speed = test_udp(SocketAddr::new(ip, 10200), SocketAddr::new(ip, 10201)).await;
+    let speed = test(0, 1, SocketAddr::new(ip, 10200), SocketAddr::new(ip, 10201)).await;
+    // let speed = test_udp(SocketAddr::new(ip, 10200), SocketAddr::new(ip, 10201)).await;
     println!("Speed: {}Mib/sec", speed);
 }
 
@@ -152,7 +150,7 @@ async fn test_udp(a1: SocketAddr, a2: SocketAddr) -> usize {
 
     let size = 4000 * 2usize.pow(20);
     let msg = vec![5u8; size];
-    let msg_clone = msg.clone();
+    // let msg_clone = msg.clone();
     let (start_tx, start_rx) = oneshot::channel();
     let (end_tx, mut end_rx) = oneshot::channel();
 
@@ -177,8 +175,7 @@ async fn test_udp(a1: SocketAddr, a2: SocketAddr) -> usize {
             let v = socket.recv_from(&mut buf).await.expect("Recv 2");
             std::hint::black_box(v);
         }
-        let duration = start_rx.await.unwrap().elapsed();
-        duration
+        start_rx.await.unwrap().elapsed()
     });
 
     let (r1, r2) = tokio::join!(h1, h2);
@@ -186,4 +183,3 @@ async fn test_udp(a1: SocketAddr, a2: SocketAddr) -> usize {
     let duration = r2.expect("Join");
     (size / 1000 * 8) / duration.as_millis() as usize
 }
-*/

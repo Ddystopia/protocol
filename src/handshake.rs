@@ -64,7 +64,7 @@ pub(crate) async fn handshake_active(
 pub(crate) async fn handshake_passive(socket: &UdpSocket) -> io::Result<Handshake> {
     'from_scratch: loop {
         let mut buf = [0; MSS];
-        let seq_num = SeqNum(4);
+        let seq_num = SeqNum::new(4);
 
         let (seq_num, addr) = 'listening_for_syn: loop {
             let Ok((len, addr)) = socket.recv_from(&mut buf).await else {
@@ -144,7 +144,7 @@ pub(crate) async fn handshake_passive_sm(socket: &UdpSocket) -> io::Result<Hands
     let mut state = State::Listening;
     let mut at = None;
     let mut buf = [0; MSS];
-    let seq_num = SeqNum(5);
+    let seq_num = SeqNum::new(5);
 
     loop {
         let result = match at {
