@@ -361,6 +361,8 @@ pub(crate) async fn _event_loop(
                     );
 
                     let bytes_before = seq_num.get() as usize * re.payload_size as usize;
+
+                    // TODO: check is llvm checks bounds and try to mitigate it
                     re.recv_bytes[bytes_before..][..data.len()].copy_from_slice(data);
                     reader = Some(re);
 
@@ -373,9 +375,9 @@ pub(crate) async fn _event_loop(
                     buf[0] |= PacketType::DataOk as u8 & !(PacketType::Data as u8);
                     #[cfg(debug_assertions)]
                     if true {
-                        let mut local_buf = [0; 4];
+                        let mut local_buf = [0; MSS];
                         DataAck(seq_num).serialize(&mut local_buf);
-                        assert_eq!(local_buf[..4], buf[..4], "Verify hask is correnct.");
+                        debug_assert_eq!(local_buf[..4], buf[..4], "Verify hask is correnct.");
                     }
                     socket.send(&buf[..4]).await?;
                 }
@@ -455,11 +457,12 @@ pub(crate) async fn _event_loop(
     }
 }
 
-#[inline]
+#[allow(clippy::inline_always)]
+#[inline(always)]
 async fn send_data_packet(
     sender: &mut SendState,
     socket: &UdpSocket,
-    buf: &mut [u8],
+    buf: &mut [u8; MSS],
     seq_num: SeqNum,
     timers: &mut DelayQueue<Expired>,
 ) -> std::io::Result<()> {

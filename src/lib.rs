@@ -22,7 +22,7 @@ use tokio::{
 use handshake::Handshake;
 
 const MTU: usize = 1500;
-const MSS: usize = MTU - 8 /* UDP */ - 20 /* IP */;
+pub(crate) const MSS: usize = MTU - 8 /* UDP */ - 20 /* IP */;
 pub const MAX_TRANSFER_SIZE: u16 = MSS as u16 - 4 /* Header for `Data` */;
 
 pub(crate) const ACK_TIMEOUT: Duration = Duration::from_millis(10);

@@ -1,8 +1,11 @@
 use std::{
     fmt::{Debug, Formatter},
+    num::Wrapping,
     ops::AddAssign,
-    str::Utf8Error, num::Wrapping,
+    str::Utf8Error,
 };
+
+use crate::MSS;
 
 #[repr(transparent)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -15,7 +18,7 @@ impl SeqNum {
     }
     #[inline]
     pub fn get(self) -> u32 {
-        self.0.0
+        self.0 .0
     }
 }
 
@@ -157,7 +160,7 @@ const fn try_from(value: u8) -> Result<PacketType, ()> {
 }
 
 #[inline]
-fn string_from_null_terminated(buf: &[u8]) -> Result<Option<&str>, Utf8Error> {
+fn string_from_null_terminated(buf: &[u8; 22]) -> Result<Option<&str>, Utf8Error> {
     let name_end = buf.iter().take(22).position(|&x| x == 0).unwrap_or(22);
     if name_end == 0 {
         return Ok(None);
@@ -167,21 +170,21 @@ fn string_from_null_terminated(buf: &[u8]) -> Result<Option<&str>, Utf8Error> {
 
 impl<'a> SendPacket<'a> {
     #[inline]
-    pub fn serialize(&self, buf: &mut [u8]) -> usize {
+    pub fn serialize(&self, buf: &mut [u8; MSS]) -> usize {
         Packet::Send(*self).serialize(buf)
     }
 }
 
 impl RecvPacket {
     #[inline]
-    pub fn serialize(self, buf: &mut [u8]) -> usize {
+    pub fn serialize(self, buf: &mut [u8; MSS]) -> usize {
         Packet::Recv(self).serialize(buf)
     }
 }
 
 impl ConnPacket {
     #[inline]
-    pub fn serialize(self, buf: &mut [u8]) -> usize {
+    pub fn serialize(self, buf: &mut [u8; MSS]) -> usize {
         Packet::Conn(self).serialize(buf)
     }
 }
@@ -195,63 +198,67 @@ impl<'a> Packet<'a> {
     /// |ssssssssssssssss|
     ///
     #[inline]
-    fn decode_sequence(bytes: &[u8]) -> SeqNum {
-        assert!(
-            bytes.len() == 4,
-            "Sequece number could be decoded only from 4 bytes"
-        );
-        let bytes = [bytes[0], bytes[1], bytes[2], bytes[3]];
+    fn decode_sequence(bytes: &[u8]) -> Option<SeqNum> {
+        if bytes.len() < 4 {
+            debug_assert!(bytes.len() >= 4, "Packet is malformed");
+            return None;
+        }
+        let bytes: [u8; 4] = [bytes[0], bytes[1], bytes[2], bytes[3]];
         let mask = (PacketType::DISCRIMINANT_MASK as u32) << 24;
-        SeqNum::new(u32::from_be_bytes(bytes) & !mask)
+        Some(SeqNum::new(u32::from_be_bytes(bytes) & !mask))
     }
 
     #[inline]
     fn encode_sequence(sequence: SeqNum, buf: &mut [u8]) {
-        buf.copy_from_slice(&sequence.0.0.to_be_bytes());
+        buf.copy_from_slice(&sequence.0 .0.to_be_bytes());
     }
 
     #[must_use]
     #[inline]
     pub fn deserialize(bytes: &'a [u8]) -> Option<Self> {
-        let discriminant = bytes[0] & PacketType::DISCRIMINANT_MASK;
-        let packet = match PacketType::try_from(discriminant).ok()? {
-            PacketType::Init => {
+        use PacketType::{
+            Data, DataOk, Fin, FinOk, FinOkOk, Init, InitOk, KeepAlive, KeepAliveOk, Nak, Syn,
+            SynAck, SynAckAck,
+        };
+
+        debug_assert!(bytes.first().is_some(), "Packet is empty");
+        let discriminant = bytes.first()? & PacketType::DISCRIMINANT_MASK;
+        let ptype = PacketType::try_from(discriminant).ok()?;
+
+        let packet = match ptype {
+            Data => Self::Send(SendPacket::Data {
+                seq_num: Self::decode_sequence(bytes)?,
+                data: &bytes[4..],
+            }),
+            DataOk => Self::Recv(RecvPacket::DataAck(Self::decode_sequence(bytes)?)),
+            Nak => Self::Recv(RecvPacket::Nak(Self::decode_sequence(bytes)?)),
+            KeepAlive => Self::Conn(ConnPacket::KeepAlive),
+            InitOk => Self::Recv(RecvPacket::InitOk),
+            KeepAliveOk => Self::Conn(ConnPacket::KeepAliveOk),
+            Syn => Self::Conn(ConnPacket::Syn),
+            SynAck => Self::Conn(ConnPacket::SynAck(Self::decode_sequence(bytes)?)),
+            SynAckAck => Self::Conn(ConnPacket::SynAckAck(Self::decode_sequence(bytes)?)),
+            Fin => Self::Send(SendPacket::Fin),
+            FinOk => Self::Recv(RecvPacket::FinOk),
+            FinOkOk => Self::Send(SendPacket::FinOkOk),
+            Init => {
+                debug_assert!(bytes.len() == 28, "Init packet is malformed");
+                let bytes: &[u8; 28] = bytes.try_into().ok()?;
                 let first = bytes[0] & !PacketType::DISCRIMINANT_MASK;
                 let payload_size = ((first as u16) << 7) | ((bytes[1] as u16) >> 1);
                 let transfer_size = u32::from_le_bytes([bytes[2], bytes[3], bytes[4], bytes[5]]);
                 Self::Send(SendPacket::Init {
                     payload_size,
                     transfer: transfer_size,
-                    name: string_from_null_terminated(&bytes[6..28]).ok()?,
+                    name: string_from_null_terminated(bytes[6..28].try_into().unwrap()).ok()?,
                 })
             }
-            PacketType::Data => Self::Send(SendPacket::Data {
-                seq_num: Self::decode_sequence(&bytes[0..4]),
-                data: &bytes[4..],
-            }),
-            PacketType::DataOk => {
-                Self::Recv(RecvPacket::DataAck(Self::decode_sequence(&bytes[0..4])))
-            }
-            PacketType::Nak => Self::Recv(RecvPacket::Nak(Self::decode_sequence(&bytes[0..4]))),
-            PacketType::KeepAlive => Self::Conn(ConnPacket::KeepAlive),
-            PacketType::InitOk => Self::Recv(RecvPacket::InitOk),
-            PacketType::KeepAliveOk => Self::Conn(ConnPacket::KeepAliveOk),
-            PacketType::Syn => Self::Conn(ConnPacket::Syn),
-            PacketType::SynAck => {
-                Self::Conn(ConnPacket::SynAck(Self::decode_sequence(&bytes[0..4])))
-            }
-            PacketType::SynAckAck => {
-                Self::Conn(ConnPacket::SynAckAck(Self::decode_sequence(&bytes[0..4])))
-            }
-            PacketType::Fin => Self::Send(SendPacket::Fin),
-            PacketType::FinOk => Self::Recv(RecvPacket::FinOk),
-            PacketType::FinOkOk => Self::Send(SendPacket::FinOkOk),
         };
         Some(packet)
     }
 
     #[inline]
-    pub fn serialize(&self, buf: &mut [u8]) -> usize {
+    pub fn serialize(&self, buf: &mut [u8; MSS]) -> usize {
         match self {
             Self::Send(SendPacket::Init {
                 payload_size,
@@ -266,7 +273,7 @@ impl<'a> Packet<'a> {
             Self::Send(SendPacket::Data { seq_num, data: _ })
             | Self::Recv(RecvPacket::DataAck(seq_num) | RecvPacket::Nak(seq_num))
             | Self::Conn(ConnPacket::SynAckAck(seq_num) | ConnPacket::SynAck(seq_num)) => {
-                let seq = seq_num.0.0 & 0xF0_00_00_00 == 0;
+                let seq = seq_num.0 .0 & 0xF0_00_00_00 == 0;
                 debug_assert!(seq, "Seq num should have 4 high bits zero");
             }
 
@@ -322,7 +329,6 @@ impl<'a> Packet<'a> {
 
         buf[0] &= !PacketType::DISCRIMINANT_MASK;
         buf[0] |= discriminant as u8;
-        // maybe `buf[0] ^= discriminant`, but idk how it works
 
         result_len
     }
@@ -370,15 +376,13 @@ const fn assert_constants() {
 mod tests {
     use super::*;
 
-    const MTU: usize = 1500;
-
     #[test]
     fn encodings_decodings() {
         let check = |n| {
             let mut buf = [0; 4];
             Packet::encode_sequence(SeqNum::new(n), &mut buf);
             assert_eq!(buf[0] & PacketType::DISCRIMINANT_MASK, 0, "Test malformed");
-            assert_eq!(SeqNum::new(n), Packet::decode_sequence(&buf));
+            assert_eq!(Some(SeqNum::new(n)), Packet::decode_sequence(&buf));
         };
         check(0x0F_FF_FF_0F);
         check(0x0A_BB_CC_0F);
@@ -387,7 +391,7 @@ mod tests {
 
     #[test]
     fn test_parse_init() {
-        let mut bytes = [0u8; MTU];
+        let mut bytes = [0u8; MSS];
         bytes[0..6].copy_from_slice(&[
             0b0000_1000,
             0b1000_0000,
@@ -398,7 +402,7 @@ mod tests {
             0b0000_0000,
         ]);
         bytes[6..11].copy_from_slice(b"hello");
-        let packet = Packet::deserialize(&bytes).unwrap();
+        let packet = Packet::deserialize(&bytes[..28]).unwrap();
         if let Packet::Send(SendPacket::Init {
             payload_size,
             transfer: transfer_size,
@@ -424,7 +428,7 @@ mod tests {
             data,
         }) = packet
         {
-            assert_eq!(sequence.0.0, 0b0000_1000_0000_1111_1111);
+            assert_eq!(sequence.0 .0, 0b0000_1000_0000_1111_1111);
             assert_eq!(data, b"data!");
         } else {
             panic!("Unexpected packet type");
@@ -439,25 +443,25 @@ mod tests {
             name: Some("testfile"),
         });
 
-        let mut buf = vec![0; 28];
+        let mut buf = [0; MSS];
         packet.serialize(&mut buf);
-        let received_packet = Packet::deserialize(&buf).unwrap();
+        let received_packet = Packet::deserialize(&buf[..28]).unwrap();
 
-        assert_eq!(packet, received_packet);
+        assert_eq!(dbg!(packet), dbg!(received_packet));
     }
 
     #[test]
     fn test_data_packet() {
         let data = vec![1, 2, 3, 4, 5];
-        let mut buf = vec![0; 4 + data.len()];
+        let mut buf = [0; MSS];
 
         let packet = SendPacket::Data {
             seq_num: SeqNum::new(5),
             data: &data,
         };
 
-        packet.serialize(&mut buf);
-        let Packet::Send(received_packet) = Packet::deserialize(&buf).unwrap() else {
+        let len = packet.serialize(&mut buf);
+        let Packet::Send(received_packet) = Packet::deserialize(&buf[..len]).unwrap() else {
             panic!("Unexpected packet type");
         };
 
@@ -468,7 +472,7 @@ mod tests {
     fn test_ack_packet() {
         let packet = RecvPacket::DataAck(SeqNum::new(10));
 
-        let mut buf = [0; 4];
+        let mut buf = [0; MSS];
         packet.serialize(&mut buf);
         let Packet::Recv(received_packet) = Packet::deserialize(&buf).unwrap() else {
             panic!("Unexpected packet type");
@@ -481,7 +485,7 @@ mod tests {
     fn test_nack_packet() {
         let packet = RecvPacket::Nak(SeqNum::new(20));
 
-        let mut buf = [0; 4];
+        let mut buf = [0; MSS];
         packet.serialize(&mut buf);
         let Packet::Recv(received_packet) = Packet::deserialize(&buf).unwrap() else {
             panic!("Unexpected packet type");
@@ -493,7 +497,7 @@ mod tests {
     fn test_syn_ack_ack_packet() {
         let packet = ConnPacket::SynAckAck(SeqNum::new(10));
 
-        let mut buf = [0; 4];
+        let mut buf = [0; MSS];
         packet.serialize(&mut buf);
         let Packet::Conn(received_packet) = Packet::deserialize(&buf).unwrap() else {
             panic!("Unexpected packet type");
@@ -506,7 +510,7 @@ mod tests {
     fn test_keep_alive_packet() {
         let packet = Packet::Conn(ConnPacket::KeepAlive);
 
-        let mut buf = [0; 1];
+        let mut buf = [0; MSS];
         packet.serialize(&mut buf);
         let received_packet = Packet::deserialize(&buf).unwrap();
 
@@ -517,7 +521,7 @@ mod tests {
     fn test_init_ok_packet() {
         let packet = Packet::Recv(RecvPacket::InitOk);
 
-        let mut buf = [0; 1];
+        let mut buf = [0; MSS];
         packet.serialize(&mut buf);
         let received_packet = Packet::deserialize(&buf).unwrap();
 
@@ -528,7 +532,7 @@ mod tests {
     fn test_ka_ok_packet() {
         let packet = Packet::Conn(ConnPacket::KeepAliveOk);
 
-        let mut buf = [0; 1];
+        let mut buf = [0; MSS];
         packet.serialize(&mut buf);
         let received_packet = Packet::deserialize(&buf).unwrap();
 

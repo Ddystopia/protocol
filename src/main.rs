@@ -1,12 +1,11 @@
 #![allow(dead_code)]
 #![allow(unused_imports)]
 
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-use tokio::{sync::oneshot, net::UdpSocket};
-use std::time::Duration;
 #[cfg(feature = "mock")]
 use std::array::from_fn;
-
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::time::Duration;
+use tokio::{net::UdpSocket, sync::oneshot};
 
 /*
 (loss is should be doubled of what is written)
@@ -142,8 +141,6 @@ async fn test(n: u32, d: u32, a1: SocketAddr, a2: SocketAddr) -> usize {
     (size / 1000 * 8) / duration.as_millis() as usize
 }
 
-
-
 async fn test_udp(a1: SocketAddr, a2: SocketAddr) -> usize {
     use protocol::{Message, Server, MAX_TRANSFER_SIZE};
     use tokio::time::Instant;
@@ -154,13 +151,14 @@ async fn test_udp(a1: SocketAddr, a2: SocketAddr) -> usize {
     let (start_tx, start_rx) = oneshot::channel();
     let (end_tx, mut end_rx) = oneshot::channel();
 
-
     let h1 = tokio::spawn(async move {
         tokio::time::sleep(Duration::from_millis(100)).await;
         start_tx.send(Instant::now()).unwrap();
         let socket = UdpSocket::bind(a1).await.expect("Server 1");
         socket.connect(a2).await.expect("Connect 1");
         println!("Active Start Sending");
+
+        socket.send(&msg[0..0]).await.expect("Send ZERO");
         for part in msg.chunks(MAX_TRANSFER_SIZE.into()) {
             socket.send(part).await.expect("Send 1");
         }
@@ -170,10 +168,13 @@ async fn test_udp(a1: SocketAddr, a2: SocketAddr) -> usize {
 
     let h2 = tokio::spawn(async move {
         let socket = UdpSocket::bind(a2).await.expect("Server 2");
-        while end_rx.try_recv().is_err() {
+        loop {
             let mut buf = vec![0u8; MAX_TRANSFER_SIZE as usize];
-            let v = socket.recv_from(&mut buf).await.expect("Recv 2");
-            std::hint::black_box(v);
+            tokio::select! {
+                biased;
+                _ = socket.recv_from(&mut buf) => (),
+                _ = &mut end_rx => break,
+            }
         }
         start_rx.await.unwrap().elapsed()
     });
