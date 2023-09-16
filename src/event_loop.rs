@@ -16,7 +16,7 @@ use crate::{
     packet::{
         ConnPacket::{self, KeepAlive, KeepAliveOk, Syn, SynAck, SynAckAck},
         PacketType,
-        RecvPacket::{self, DataAck, FinOk, InitOk, Nak},
+        RecvPacket::{self, DataAck, FinOk, InitOk},
         SendPacket::{self, Data, Fin, FinOkOk, Init},
     },
     packet::{Packet, SeqNum},
@@ -258,13 +258,6 @@ pub(crate) async fn _event_loop(
                     sender = Some(se);
                 }
 
-                (SendSig::Packet(Nak(seq_num)), Some(mut se)) => {
-                    // TODO: is it correct with timers etc?
-                    send_data_packet(&mut se, &socket, &mut buf, seq_num, &mut timers).await?;
-
-                    sender = Some(se);
-                }
-
                 (SendSig::FinExpired, Some(mut se)) => {
                     let len = Fin.serialize(&mut buf);
                     socket.send(&buf[..len]).await?;
@@ -355,10 +348,10 @@ pub(crate) async fn _event_loop(
             Sig::Recv(sig) => match (sig, reader) {
                 (RecvSig::Packet(Data { seq_num, data }), Some(mut re)) => {
                     // TODO: Nak maybe?
-                    debug_assert!(
-                        data.len() <= re.payload_size.into(),
-                        "Data packet size is bigger then payload_size",
-                    );
+                    if data.len() > re.payload_size.into() {
+                        reader = Some(re);
+                        continue 'event_loop;
+                    }
 
                     let bytes_before = seq_num.get() as usize * re.payload_size as usize;
 

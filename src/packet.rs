@@ -88,7 +88,6 @@ impl Debug for SendPacket<'_> {
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub enum RecvPacket {
     DataAck(SeqNum),
-    Nak(SeqNum),
     InitOk,
     FinOk,
 }
@@ -104,7 +103,6 @@ pub(crate) enum PacketType {
     Init = 0b0000 << 4,
     Data = 0b0001 << 4,
     DataOk = 0b0101 << 4,
-    Nak = 0b0110 << 4,
     KeepAlive = 0b0010 << 4,
     InitOk = 0b0011 << 4,
     KeepAliveOk = 0b0100 << 4,
@@ -122,7 +120,6 @@ impl PacketType {
     const INIT: u8 = Self::Init as u8;
     const DATA: u8 = Self::Data as u8;
     const DATA_OK: u8 = Self::DataOk as u8;
-    const NAK: u8 = Self::Nak as u8;
     const KEEPALIVE: u8 = Self::KeepAlive as u8;
     const INIT_OK: u8 = Self::InitOk as u8;
     const KEEPALIVE_OK: u8 = Self::KeepAliveOk as u8;
@@ -148,7 +145,6 @@ const fn try_from(value: u8) -> Result<PacketType, ()> {
         PacketType::INIT => Ok(PacketType::Init),
         PacketType::DATA => Ok(PacketType::Data),
         PacketType::DATA_OK => Ok(PacketType::DataOk),
-        PacketType::NAK => Ok(PacketType::Nak),
         PacketType::KEEPALIVE => Ok(PacketType::KeepAlive),
         PacketType::INIT_OK => Ok(PacketType::InitOk),
         PacketType::KEEPALIVE_OK => Ok(PacketType::KeepAliveOk),
@@ -217,7 +213,7 @@ impl<'a> Packet<'a> {
     #[inline]
     pub fn deserialize(bytes: &'a [u8]) -> Option<Self> {
         use PacketType::{
-            Data, DataOk, Fin, FinOk, FinOkOk, Init, InitOk, KeepAlive, KeepAliveOk, Nak, Syn,
+            Data, DataOk, Fin, FinOk, FinOkOk, Init, InitOk, KeepAlive, KeepAliveOk, Syn,
             SynAck, SynAckAck,
         };
 
@@ -231,7 +227,6 @@ impl<'a> Packet<'a> {
                 data: &bytes[4..],
             }),
             DataOk => Self::Recv(RecvPacket::DataAck(Self::decode_sequence(bytes)?)),
-            Nak => Self::Recv(RecvPacket::Nak(Self::decode_sequence(bytes)?)),
             KeepAlive => Self::Conn(ConnPacket::KeepAlive),
             InitOk => Self::Recv(RecvPacket::InitOk),
             KeepAliveOk => Self::Conn(ConnPacket::KeepAliveOk),
@@ -271,7 +266,7 @@ impl<'a> Packet<'a> {
                 debug_assert!(len, "Name should not be greater then 22 bytes");
             }
             Self::Send(SendPacket::Data { seq_num, data: _ })
-            | Self::Recv(RecvPacket::DataAck(seq_num) | RecvPacket::Nak(seq_num))
+            | Self::Recv(RecvPacket::DataAck(seq_num))
             | Self::Conn(ConnPacket::SynAckAck(seq_num) | ConnPacket::SynAck(seq_num)) => {
                 let seq = seq_num.0 .0 & 0xF0_00_00_00 == 0;
                 debug_assert!(seq, "Seq num should have 4 high bits zero");
@@ -302,7 +297,7 @@ impl<'a> Packet<'a> {
                 4 + data.len()
             }
             Self::Conn(ConnPacket::SynAckAck(seq_num) | ConnPacket::SynAck(seq_num))
-            | Self::Recv(RecvPacket::DataAck(seq_num) | RecvPacket::Nak(seq_num)) => {
+            | Self::Recv(RecvPacket::DataAck(seq_num)) => {
                 Self::encode_sequence(seq_num, &mut buf[0..4]);
                 4
             }
@@ -315,7 +310,6 @@ impl<'a> Packet<'a> {
             Self::Send(SendPacket::Init { .. }) => PacketType::Init,
             Self::Send(SendPacket::Data { .. }) => PacketType::Data,
             Self::Recv(RecvPacket::DataAck(..)) => PacketType::DataOk,
-            Self::Recv(RecvPacket::Nak(..)) => PacketType::Nak,
             Self::Conn(ConnPacket::KeepAlive) => PacketType::KeepAlive,
             Self::Recv(RecvPacket::InitOk) => PacketType::InitOk,
             Self::Conn(ConnPacket::KeepAliveOk) => PacketType::KeepAliveOk,
@@ -338,7 +332,7 @@ impl<'a> Packet<'a> {
 const ASSERT_CONSTANTS: () = assert_constants();
 
 const fn assert_constants() {
-    const DISCRIMINANTS: [PacketType; 13] = [
+    const DISCRIMINANTS: [PacketType; 12] = [
         PacketType::Syn,
         PacketType::SynAck,
         PacketType::SynAckAck,
@@ -348,7 +342,6 @@ const fn assert_constants() {
         PacketType::InitOk,
         PacketType::KeepAliveOk,
         PacketType::DataOk,
-        PacketType::Nak,
         PacketType::Fin,
         PacketType::FinOk,
         PacketType::FinOkOk,
@@ -481,18 +474,6 @@ mod tests {
         assert_eq!(packet, received_packet);
     }
 
-    #[test]
-    fn test_nack_packet() {
-        let packet = RecvPacket::Nak(SeqNum::new(20));
-
-        let mut buf = [0; MSS];
-        packet.serialize(&mut buf);
-        let Packet::Recv(received_packet) = Packet::deserialize(&buf).unwrap() else {
-            panic!("Unexpected packet type");
-        };
-
-        assert_eq!(packet, received_packet);
-    }
     #[test]
     fn test_syn_ack_ack_packet() {
         let packet = ConnPacket::SynAckAck(SeqNum::new(10));
