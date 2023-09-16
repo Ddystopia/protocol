@@ -194,7 +194,7 @@ impl ConnPacket {
 }
 
 #[derive(Debug)]
-pub(crate) struct CorruptedPacket(pub SeqNum);
+pub(crate) struct CorruptedPacket;
 
 impl<'a> Packet<'a> {
     /// Parses 28 bytes u32 like that
@@ -234,7 +234,7 @@ impl<'a> Packet<'a> {
             let discriminant = b & PacketType::DISCRIMINANT_MASK;
 
             return if discriminant == PacketType::Data as u8 {
-                Err(CorruptedPacket(Self::decode_sequence(bytes).unwrap()))
+                Err(CorruptedPacket)
             } else {
                 Ok(None)
             };

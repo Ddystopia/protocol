@@ -15,9 +15,8 @@ use crate::{
     handshake::Handshake,
     packet::{
         ConnPacket::{self, KeepAlive, KeepAliveOk, Syn, SynAck, SynAckAck},
-        PacketType,
         RecvPacket::{self, DataAck, FinOk, InitOk, Nak},
-        SendPacket::{self, Data, Fin, FinOkOk, Init},
+        SendPacket::{self, Data, Fin, FinOkOk, Init}, CorruptedPacket,
     },
     packet::{Packet, SeqNum},
     Message, MessageData, ShutdownSignalZST, UdpSocket, ACK_TIMEOUT, KA_TIMEOUT, MSS,
@@ -143,10 +142,15 @@ pub(crate) async fn _event_loop(
                 next_keep_alive = Instant::now() + KA_TIMEOUT;
                 match socket_res {
                     Ok(len) => match Packet::deserialize(&buf[..len]) {
-                        Some(Packet::Conn(p)) => Sig::Conn(ConnSig::Packet(p)),
-                        Some(Packet::Send(p)) => Sig::Recv(RecvSig::Packet(p)),
-                        Some(Packet::Recv(p)) => Sig::Send(SendSig::Packet(p)),
-                        None => continue 'event_loop,
+                        Ok(Some(Packet::Conn(p))) => Sig::Conn(ConnSig::Packet(p)),
+                        Ok(Some(Packet::Send(p))) => Sig::Recv(RecvSig::Packet(p)),
+                        Ok(Some(Packet::Recv(p))) => Sig::Send(SendSig::Packet(p)),
+                        Ok(None) => continue 'event_loop,
+                        Err(CorruptedPacket(seq)) => {
+                            let len = Nak(seq).serialize(&mut buf);
+                            socket.send(&buf[..len]).await?;
+                            continue 'event_loop;
+                        }
                     }
                     Err(e) => Sig::Conn(ConnSig::SocketError(e))
                 }
@@ -260,6 +264,7 @@ pub(crate) async fn _event_loop(
 
                 (SendSig::Packet(Nak(seq_num)), Some(mut se)) => {
                     // TODO: is it correct with timers etc?
+                    println!("Nak received =========================");
                     send_data_packet(&mut se, &socket, &mut buf, seq_num, &mut timers).await?;
 
                     sender = Some(se);
@@ -366,20 +371,10 @@ pub(crate) async fn _event_loop(
                     re.recv_bytes[bytes_before..][..data.len()].copy_from_slice(data);
                     reader = Some(re);
 
-                    // // A slover version
-                    // let mut local_buf = [0; 4];
-                    // DataAck(seq_num).serialize(&mut local_buf);
-                    // socket.send(&local_buf[..4]).await?;
 
-                    // A faster version.
-                    buf[0] |= PacketType::DataOk as u8 & !(PacketType::Data as u8);
-                    #[cfg(debug_assertions)]
-                    if true {
-                        let mut local_buf = [0; MSS];
-                        DataAck(seq_num).serialize(&mut local_buf);
-                        debug_assert_eq!(local_buf[..4], buf[..4], "Verify hask is correnct.");
-                    }
-                    socket.send(&buf[..4]).await?;
+                    // A slover version
+                    let len = DataAck(seq_num).serialize(&mut buf);
+                    socket.send(&buf[..len]).await?;
                 }
 
                 (s @ (RecvSig::Packet(Fin) | RecvSig::FinOkExpired), Some(mut re)) => {
@@ -466,6 +461,7 @@ async fn send_data_packet(
     seq_num: SeqNum,
     timers: &mut DelayQueue<Expired>,
 ) -> std::io::Result<()> {
+
     let payload_size = sender.payload_size as usize;
     let bytes_before = seq_num.get() as usize * payload_size;
 
@@ -478,6 +474,17 @@ async fn send_data_packet(
         data: &next_bytes[..payload_size.min(next_bytes.len())],
     }
     .serialize(buf);
+
+    #[cfg(feature = "break")]
+    {
+        use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
+        static C: AtomicUsize = AtomicUsize::new(0);
+        if C.fetch_add(1, Relaxed) == 300_000 {
+            buf[29] = (C.load(Relaxed) % 256) as u8;
+        }
+    }
+
+
     socket.send(&buf[..len]).await?;
 
     let key = timers.insert(Expired::Ack(seq_num), ACK_TIMEOUT);

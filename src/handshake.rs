@@ -35,7 +35,7 @@ pub(crate) async fn handshake_active(
         let timeout_result = time::timeout_at(timeout, socket.recv(&mut buf)).await;
         match timeout_result {
             Ok(Ok(len)) => {
-                let Some(packet) = Packet::deserialize(&buf[..len]) else {
+                let Ok(Some(packet)) = Packet::deserialize(&buf[..len]) else {
                     continue 'awaiting_for_syn_ack;
                 };
                 if let Packet::Conn(ConnPacket::SynAck(seq_num)) = packet {
@@ -70,7 +70,8 @@ pub(crate) async fn handshake_passive(socket: &UdpSocket) -> io::Result<Handshak
             let Ok((len, addr)) = socket.recv_from(&mut buf).await else {
                 continue 'listening_for_syn;
             };
-            let Some(packet) = Packet::deserialize(&buf[..len]) else {
+
+            let Ok(Some(packet)) = Packet::deserialize(&buf[..len]) else {
                 continue 'listening_for_syn;
             };
 
@@ -89,12 +90,12 @@ pub(crate) async fn handshake_passive(socket: &UdpSocket) -> io::Result<Handshak
 
             match timeout_resut {
                 Ok(Ok((len, a))) => match Packet::deserialize(&buf[..len]) {
-                    Some(Packet::Conn(ConnPacket::SynAckAck(seq_num_i)))
+                    Ok(Some(Packet::Conn(ConnPacket::SynAckAck(seq_num_i))))
                         if seq_num == seq_num_i && addr == a =>
                     {
                         break 'awaiting_for_ack
                     }
-                    Some(Packet::Conn(ConnPacket::Syn)) => {
+                    Ok(Some(Packet::Conn(ConnPacket::Syn))) => {
                         let syn_ack = ConnPacket::SynAck(seq_num);
                         let len = syn_ack.serialize(&mut buf);
                         socket.send_to(&buf[..len], addr).await?;
@@ -153,7 +154,7 @@ pub(crate) async fn handshake_passive_sm(socket: &UdpSocket) -> io::Result<Hands
         };
         let signal = match result {
             Ok(Ok((len, addr))) => match Packet::deserialize(&buf[..len]) {
-                Some(Packet::Conn(packet)) => Sig::Packet(packet, addr),
+                Ok(Some(Packet::Conn(packet))) => Sig::Packet(packet, addr),
                 _ => continue,
             },
             Ok(Err(e)) => Sig::Error(e),
@@ -230,5 +231,4 @@ mod test {
         r1.unwrap().unwrap();
         r2.unwrap().unwrap();
     }
-
 }

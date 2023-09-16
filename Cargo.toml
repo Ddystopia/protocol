@@ -8,6 +8,7 @@ edition = "2021"
 [features]
 default = []
 mock = []
+break = []
 
 [profile.release]
 codegen-units = 1
@@ -18,6 +19,7 @@ lto = true
 opt-level = 2
 
 [dependencies]
+crc = "3.0.1"
 futures = "0.3.28"
 rand = { version = "0.8.5", features = ["getrandom"] }
 rustc-hash = "1.1.0"
