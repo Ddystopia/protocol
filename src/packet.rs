@@ -221,7 +221,7 @@ impl<'a> Packet<'a> {
     }
 
     #[inline]
-    pub fn deserialize(bytes: &'a [u8]) -> Result<Option<Self>, CorruptedPacket> {
+    pub(crate) fn deserialize(bytes: &'a [u8]) -> Result<Option<Self>, CorruptedPacket> {
         debug_assert!(bytes.len() > CRC_BYTES, "Packet is malformed");
 
         let (c, bytes) = bytes.split_at(CRC_BYTES);
